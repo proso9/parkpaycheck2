@@ -29,6 +29,12 @@ data/output/
 logs/*.log
 logs/*.out
 
+# 异常车辆检测脚本的输出结果
+output/
+
+# 测试脚本
+tests/
+
 # 保留空目录结构（使文件夹能被提交到仓库）
 !data/output/.gitkeep
 !logs/.gitkeep
