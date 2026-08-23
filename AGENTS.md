@@ -11,16 +11,20 @@
 ```
 parkpaycheck_v2/
 ├── AGENTS.md                       # 本文件
+├── README.md                       # 项目介绍、使用说明与依赖安装命令
 ├── check_unopened_gate.py          # 命令行入口（薄封装，调用 parkcheck.cli）
+├── check_gui.py                    # 图形界面入口（tkinter 分页 + APScheduler + 系统托盘）
 ├── parkcheck/                      # 检测包
 │   ├── __init__.py                 # 公共 API 聚合导出
 │   ├── config.py                   # 常量与默认参数
 │   ├── parser.py                   # 日志解析
 │   ├── detector.py                 # 异常判定与入场反查
 │   ├── output.py                   # 结果输出（控制台 + CSV）
+│   ├── scheduler.py                # 定时任务（APScheduler 封装）
 │   └── cli.py                      # 命令行入口
 ├── tests/
-│   └── test_check_unopened_gate.py # 无依赖断言式测试
+│   ├── test_check_unopened_gate.py # 核心逻辑无依赖断言式测试
+│   └── test_scheduler.py           # 定时任务模块测试（依赖 apscheduler）
 ├── document/                       # 日志样例(输入, 不入库)
 │   └── system.<日期>.log
 └── output/                         # 脚本导出的 CSV(不入库, 自动创建)
@@ -69,13 +73,42 @@ python -m parkcheck.cli -w 300 -o output
 
 参数均在 `parkcheck/config.py` 定义默认值，并在 `parkcheck/cli.py` 的 argparse 中提供覆盖，未硬编码。
 
+## 图形界面与定时任务
+
+```bash
+# 启动图形界面（含路径/参数/定时任务配置，配置可导入导出 JSON）
+python check_gui.py
+```
+
+图形界面（`check_gui.py`）在命令行能力基础上增加**分页配置**与**系统托盘后台运行**：
+
+- **分页配置**（`ttk.Notebook`）：路径配置 / 判定参数 / 定时任务 / 运行输出 四个页签，配置相互隔离、互不干扰。
+- **定时任务**（基于 APScheduler，见 `parkcheck/scheduler.py`）：
+  - 勾选「启用定时任务」即按配置在后台自动定时检测，取消勾选即停止。
+  - 支持两种方式：
+    - **间隔运行**：每隔 N 秒/分/时运行一次；
+    - **每天固定时间**：每天 HH:MM（如 08:00）运行一次。
+  - 定时检测每次触发会**实时读取**当前界面的日志目录、输出目录与判定参数，修改后无需重启即生效。
+  - 状态栏显示「下次触发」时间。
+- **系统托盘后台运行**（pystray）：
+  - 点击窗口关闭按钮 → 自动收纳到右下角系统托盘（`root.withdraw()`），后台定时任务继续运行；
+  - 托盘菜单：「显示主窗口」恢复窗口、「退出程序」完全退出；
+  - 托盘不可用（未安装 pystray/Pillow）时回退为最小化到任务栏；
+  - 菜单栏「配置 → 退出程序」为显式退出路径；完全退出时会停止调度器并移除托盘图标。
+- 定时配置随「导出/导入配置」JSON 一同保存恢复（字段：`schedule_enabled / schedule_type / schedule_value / schedule_unit / schedule_time`）。
+- 调度逻辑封装在 `SchedulerManager`（`start_interval` / `start_daily` / `stop` / `running` / `next_run`），与手动检测共用同一检测流程，可独立复用。
+
 ## 测试
 
 ```bash
+# 核心逻辑测试（无第三方依赖）
 python -m tests.test_check_unopened_gate
+
+# 定时任务模块测试（依赖 apscheduler）
+python -m tests.test_scheduler
 ```
 
-测试无第三方依赖，用断言校验各类正常/异常/边界/容错场景，退出码 0 表示全部通过。
+两套测试均用断言校验，退出码 0 表示全部通过。
 
 ## 约定与注意事项
 
@@ -83,4 +116,5 @@ python -m tests.test_check_unopened_gate
 - `document/`、`output/`、`tests/` 均已加入 `.gitignore`。
 - 日志为 `system.<YYYY-MM-DD>.log` 命名，输出 CSV 用同日期命名（`异常车辆_<YYYY-MM-DD>.csv`）。
 - 修改判定逻辑后请补充/调整测试并确保全部通过。
+- 图形界面依赖第三方库：定时任务 `apscheduler`、系统托盘 `pystray`/`Pillow`（安装命令见 `README.md`），核心检测逻辑仍保持无第三方依赖。
 - 代码注释、文档一律使用简体中文。

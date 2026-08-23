@@ -3,11 +3,12 @@
 parkcheck 包：停车场系统日志异常车辆检测。
 
 模块划分：
-  config   常量与默认参数
-  parser   日志解析
-  detector 异常判定与入场反查
-  output   结果输出
-  cli      命令行入口
+  config    常量与默认参数
+  parser    日志解析
+  detector  异常判定与入场反查
+  output    结果输出
+  scheduler 定时任务（APScheduler 封装）
+  cli       命令行入口
 
 对外统一导出公共 API，便于外部（含测试）通过 `import parkcheck` 直接使用。
 """
@@ -20,6 +21,7 @@ from .config import (
 from .parser import parse_log
 from .detector import find_anomalies
 from .output import output_results
+from .scheduler import SchedulerManager
 from .cli import main
 
 __all__ = [
@@ -29,5 +31,6 @@ __all__ = [
     "parse_log",
     "find_anomalies",
     "output_results",
+    "SchedulerManager",
     "main",
 ]

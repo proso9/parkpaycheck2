@@ -7,6 +7,13 @@
   - CSV 输出目录
   - 各项判定参数（窗口、费用关联窗口、停车时间关联窗口、
     最小停车时间偏差、入场去重窗口）
+  - 定时任务（基于 APScheduler）：间隔运行 / 每天固定时间，
+    配置项（间隔值/单位、HH:MM、开关）均可直接编辑
+
+配置按分页隔离：路径配置 / 判定参数 / 定时任务 / 运行输出。
+
+关闭窗口后自动收纳到系统托盘（pystray）继续后台运行，
+托盘菜单可重新打开主窗口或完全退出。
 
 后台线程执行与命令行一致的处理流程：
   parse_log → find_anomalies → output_results
@@ -16,6 +23,7 @@
 import os
 import sys
 import json
+import time
 import threading
 from io import StringIO
 from contextlib import redirect_stdout
@@ -32,6 +40,11 @@ from parkcheck.config import (
     MIN_PARK_TIME_DEVIATION,
     ENTRY_DEDUP_WINDOW,
     DEFAULT_OUT_DIR,
+)
+from parkcheck.scheduler import (
+    SchedulerManager,
+    interval_to_seconds,
+    validate_daily_time,
 )
 from parkcheck.parser import parse_log
 from parkcheck.detector import find_anomalies
@@ -51,15 +64,24 @@ def collect_log_files(path):
 
 
 class CheckGui:
-    """主窗口：配置区 + 参数区 + 运行按钮 + 结果回显区。"""
+    """主窗口：分页配置（路径 / 判定参数 / 定时任务）+ 运行输出；关闭后收纳系统托盘。"""
 
     def __init__(self, root):
         self.root = root
         root.title("停车场异常车辆检测")
-        root.geometry("720x640")
-        root.minsize(620, 540)
+        root.geometry("760x660")
+        root.minsize(640, 560)
+
+        self._scheduler = SchedulerManager()   # 定时任务调度器
+        self._schedule_running = False         # 定时任务单轮执行重入锁
+        self._tray_icon = None                 # 系统托盘图标（pystray）
+        self._tray_available = False           # 托盘是否可用
+        self._hidden_to_tray = False           # 是否已提示过收纳信息
 
         self._build_widgets()
+        self._setup_tray()
+        # 关闭按钮：收纳到系统托盘（后台定时任务继续运行），托盘菜单可完全退出
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- 界面搭建 ----------------
     def _field_row(self, parent, label, default):
@@ -73,7 +95,7 @@ class CheckGui:
     def _build_widgets(self):
         pad = {"padx": 8, "pady": 4}
 
-        # 顶部菜单栏：说明 / 配置
+        # 顶部菜单栏：说明 / 配置（含退出程序）
         menubar = tk.Menu(self.root)
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="查看参数说明…", command=self._show_help)
@@ -82,63 +104,120 @@ class CheckGui:
         config_menu = tk.Menu(menubar, tearoff=0)
         config_menu.add_command(label="导出配置…", command=self._export_config)
         config_menu.add_command(label="导入配置…", command=self._import_config)
+        config_menu.add_separator()
+        config_menu.add_command(label="退出程序", command=self._quit_app)
         menubar.add_cascade(label="配置", menu=config_menu)
         self.root.config(menu=menubar)
 
-        # 顶部：路径配置
-        path_frame = ttk.LabelFrame(self.root, text="路径配置", padding=8)
-        path_frame.pack(fill="x", **pad)
+        # 分页：路径配置 / 判定参数 / 定时任务 / 运行输出
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True, **pad)
 
-        row1 = ttk.Frame(path_frame)
-        row1.pack(fill="x", pady=2)
+        tab_paths = ttk.Frame(notebook, padding=10)
+        tab_params = ttk.Frame(notebook, padding=10)
+        tab_sched = ttk.Frame(notebook, padding=10)
+        tab_run = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_paths, text="路径配置")
+        notebook.add(tab_params, text="判定参数")
+        notebook.add(tab_sched, text="定时任务")
+        notebook.add(tab_run, text="运行与输出")
+
+        self._build_paths_tab(tab_paths)
+        self._build_params_tab(tab_params)
+        self._build_schedule_tab(tab_sched)
+        self._build_run_tab(tab_run)
+
+    def _build_paths_tab(self, parent):
+        """路径配置页：日志目录 + 输出目录。"""
+        row1 = ttk.Frame(parent)
+        row1.pack(fill="x", pady=4)
         # 默认日志目录 / 输出目录均转成绝对路径，避免相对路径歧义
         self.log_var = self._field_row(
             row1, "日志目录：", os.path.abspath(os.path.join(_PROJECT_ROOT, "document"))
         )
         ttk.Button(row1, text="浏览…", command=self._pick_log).pack(side="left", padx=(6, 0))
 
-        row2 = ttk.Frame(path_frame)
-        row2.pack(fill="x", pady=2)
+        row2 = ttk.Frame(parent)
+        row2.pack(fill="x", pady=4)
         self.out_var = self._field_row(
             row2, "输出目录：", os.path.abspath(os.path.join(_PROJECT_ROOT, DEFAULT_OUT_DIR))
         )
         ttk.Button(row2, text="浏览…", command=self._pick_out).pack(side="left", padx=(6, 0))
 
-        # 中部：参数配置
-        param_frame = ttk.LabelFrame(self.root, text="判定参数", padding=8)
-        param_frame.pack(fill="x", **pad)
-
-        def spin_row(parent, label, default):
-            frame = ttk.Frame(parent)
-            frame.pack(fill="x", pady=2)
+    def _build_params_tab(self, parent):
+        """判定参数页：判定窗口 / 停车时间偏差 / 入场去重窗口。"""
+        def spin_row(frame, label, default):
             ttk.Label(frame, text=label, width=22).pack(side="left")
             var = tk.StringVar(value=str(default))
             ttk.Spinbox(frame, from_=0, to=100000, width=8, textvariable=var).pack(side="left")
             return var
 
-        grid = ttk.Frame(param_frame)
-        grid.pack(fill="x")
+        grid = ttk.Frame(parent)
+        grid.pack(fill="x", pady=4)
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
 
         left = ttk.Frame(grid)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=4)
         right = ttk.Frame(grid)
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=4)
 
         self.window_var = spin_row(left, "判定窗口(秒)", WINDOW_SECONDS)
         self.dev_var = spin_row(right, "最小停车时间偏差(分钟)", MIN_PARK_TIME_DEVIATION)
         self.dedup_var = spin_row(left, "入场去重窗口(秒)", ENTRY_DEDUP_WINDOW)
 
-        # 底部：运行按钮 + 结果回显
-        btn_frame = ttk.Frame(self.root)
-        btn_frame.pack(fill="x", **pad)
+    def _build_schedule_tab(self, parent):
+        """定时任务页：开关 / 类型 / 间隔 / 每天时间 / 状态。"""
+        self._schedule_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            parent,
+            text="启用定时任务（按下方配置定时运行检测）",
+            variable=self._schedule_enabled,
+            command=self._on_schedule_toggle,
+        ).pack(anchor="w", pady=(4, 8))
+
+        type_row = ttk.Frame(parent)
+        type_row.pack(fill="x", pady=4)
+        ttk.Label(type_row, text="任务类型：").pack(side="left")
+        self._schedule_type = tk.StringVar(value="interval")
+        ttk.Radiobutton(type_row, text="间隔运行", value="interval",
+                        variable=self._schedule_type).pack(side="left")
+        ttk.Radiobutton(type_row, text="每天固定时间", value="daily",
+                        variable=self._schedule_type).pack(side="left", padx=(12, 0))
+
+        interval_row = ttk.Frame(parent)
+        interval_row.pack(fill="x", pady=4)
+        ttk.Label(interval_row, text="间隔：").pack(side="left")
+        self._schedule_value = tk.StringVar(value="30")
+        ttk.Spinbox(interval_row, from_=1, to=100000, width=8,
+                    textvariable=self._schedule_value).pack(side="left")
+        self._schedule_unit = tk.StringVar(value="分")
+        ttk.Combobox(interval_row, textvariable=self._schedule_unit,
+                     values=["秒", "分", "时"], width=4,
+                     state="readonly").pack(side="left", padx=(6, 0))
+        ttk.Label(interval_row, text="运行一次").pack(side="left", padx=(6, 0))
+
+        daily_row = ttk.Frame(parent)
+        daily_row.pack(fill="x", pady=4)
+        ttk.Label(daily_row, text="每天：").pack(side="left")
+        self._schedule_time = tk.StringVar(value="08:00")
+        ttk.Entry(daily_row, textvariable=self._schedule_time, width=8).pack(side="left")
+        ttk.Label(daily_row, text="（HH:MM，如 08:00）").pack(side="left", padx=(6, 0))
+
+        self._schedule_status_var = tk.StringVar(value="定时任务：未启动")
+        ttk.Label(parent, textvariable=self._schedule_status_var,
+                  foreground="#0066cc").pack(anchor="w", pady=(10, 0))
+
+    def _build_run_tab(self, parent):
+        """运行输出页：运行按钮 + 清空 + 结果回显。"""
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill="x", pady=(0, 6))
         self.run_btn = ttk.Button(btn_frame, text="开始检测", command=self._start)
         self.run_btn.pack(side="left")
         ttk.Button(btn_frame, text="清空输出", command=self._clear_output).pack(side="left", padx=(6, 0))
 
-        out_frame = ttk.LabelFrame(self.root, text="运行输出", padding=8)
-        out_frame.pack(fill="both", expand=True, **pad)
+        out_frame = ttk.LabelFrame(parent, text="运行与输出", padding=8)
+        out_frame.pack(fill="both", expand=True)
         self.output_box = tk.Text(out_frame, wrap="none", height=16)
         self.output_box.pack(side="left", fill="both", expand=True)
         scroll_y = ttk.Scrollbar(out_frame, orient="vertical", command=self.output_box.yview)
@@ -182,6 +261,14 @@ class CheckGui:
 5. 输出目录
    CSV 结果导出目录（使用绝对路径），不存在时自动创建。
 
+6. 定时任务（APScheduler）
+   勾选“启用定时任务”后，将按下方配置在后台自动定时检测：
+   - 间隔运行：每隔 N 秒/分/时运行一次；
+   - 每天固定时间：每天 HH:MM（如 08:00）运行一次。
+   定时检测每次触发都会实时读取当前界面的路径与参数配置，
+   修改后无需重启即生效；勾选框取消即停止。
+   任务状态栏会显示“下次触发”时间，便于确认已生效。
+
 费用与系统“停车时间”与出场相机识别同时出现，直接按时间取最近一条，无需单独配置。"""
 
     def _show_help(self):
@@ -214,6 +301,11 @@ class CheckGui:
             "window": self._read_int(self.window_var, "判定窗口"),
             "deviation": self._read_int(self.dev_var, "最小停车时间偏差"),
             "dedup": self._read_int(self.dedup_var, "入场去重窗口"),
+            "schedule_enabled": bool(self._schedule_enabled.get()),
+            "schedule_type": self._schedule_type.get(),
+            "schedule_value": self._read_int(self._schedule_value, "定时间隔"),
+            "schedule_unit": self._schedule_unit.get(),
+            "schedule_time": self._schedule_time.get().strip(),
         }
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -252,6 +344,25 @@ class CheckGui:
                 except (TypeError, ValueError):
                     messagebox.showwarning("导入配置",
                                            f"{label} 不是合法整数，已跳过：{data[key]!r}")
+        # 定时任务配置
+        if "schedule_enabled" in data:
+            self._schedule_enabled.set(bool(data["schedule_enabled"]))
+        if data.get("schedule_type") in ("interval", "daily"):
+            self._schedule_type.set(data["schedule_type"])
+        if "schedule_value" in data:
+            try:
+                self._schedule_value.set(str(int(data["schedule_value"])))
+            except (TypeError, ValueError):
+                pass
+        if data.get("schedule_unit") in ("秒", "分", "时"):
+            self._schedule_unit.set(data["schedule_unit"])
+        if "schedule_time" in data:
+            self._schedule_time.set(str(data["schedule_time"]).strip() or self._schedule_time.get())
+        # 应用定时开关：导入后按配置启动/停止
+        if self._schedule_enabled.get():
+            self._start_schedule()
+        else:
+            self._stop_schedule()
         messagebox.showinfo("导入配置", "配置已导入。")
 
     def _read_int(self, var, label):
@@ -294,14 +405,18 @@ class CheckGui:
 
     def _run_worker(self, log_path, out_dir, params):
         """后台执行处理流程，捕获标准输出回显到界面。"""
+        text, status = self._run_detection(log_path, out_dir, params)
+        self._finish(text, f"运行{status}")
+
+    def _run_detection(self, log_path, out_dir, params):
+        """执行检测流程（纯计算，后台线程可调用），返回 (输出文本, 状态)。"""
         buf = StringIO()
         try:
             with redirect_stdout(buf):
                 files, err = collect_log_files(log_path)
                 if err:
                     print(err)
-                    self._finish(buf, "运行失败")
-                    return
+                    return buf.getvalue(), "失败"
                 for path in files:
                     record_a, record_b, record_entry = parse_log(path)
                     abnormal = find_anomalies(
@@ -311,20 +426,182 @@ class CheckGui:
                     )
                     output_results(abnormal, path, out_dir)
                 print("\n全部处理完成。")
-            self._finish(buf, "运行完成")
-        except Exception as exc:  # 界面层兜底，避免线程静默崩溃
+        except Exception as exc:  # 界面层兜底，避免后台线程静默崩溃
             buf.write(f"\n发生错误：{exc}\n")
-            self._finish(buf, "运行出错")
+            return buf.getvalue(), "出错"
+        return buf.getvalue(), "完成"
 
-    def _finish(self, buf, status):
-        """把输出写到文本框，并恢复按钮状态。"""
+    def _finish(self, text, status):
+        """把输出写到文本框，并恢复按钮状态（须在主线程调用）。"""
+        self.output_box.insert("end", text)
+        self.output_box.see("end")
+        self.run_btn.config(state="normal")
+        self.root.title(f"停车场异常车辆检测 - {status}")
+
+    # ---------------- 定时任务（APScheduler） ----------------
+    def _on_schedule_toggle(self):
+        """定时任务开关：勾选即按当前配置启动，取消即停止。"""
+        if self._schedule_enabled.get():
+            self._start_schedule()
+        else:
+            self._stop_schedule()
+
+    def _schedule_cfg_error(self):
+        """校验当前定时配置，返回错误信息；无错返回 None。"""
+        try:
+            self._parse_params()
+        except ValueError as exc:
+            return f"检测参数无效：{exc}"
+        try:
+            if self._schedule_type.get() == "daily":
+                validate_daily_time(self._schedule_time.get())
+            else:
+                value = int(self._schedule_value.get())
+                if value <= 0:
+                    raise ValueError("间隔值必须为正整数")
+                interval_to_seconds(value, self._schedule_unit.get())
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    def _start_schedule(self):
+        """按界面配置启动定时任务；配置非法时提示并回退开关。"""
+        err = self._schedule_cfg_error()
+        if err:
+            messagebox.showerror("定时任务", err)
+            self._schedule_enabled.set(False)
+            self._update_schedule_status()
+            return
+        if self._schedule_type.get() == "daily":
+            self._scheduler.start_daily(self._on_schedule_fire, self._schedule_time.get())
+        else:
+            self._scheduler.start_interval(
+                self._on_schedule_fire,
+                int(self._schedule_value.get()),
+                self._schedule_unit.get(),
+            )
+        self._update_schedule_status()
+
+    def _stop_schedule(self):
+        """停止定时任务。"""
+        self._scheduler.stop()
+        self._update_schedule_status()
+
+    def _update_schedule_status(self):
+        """刷新定时任务状态标签（须在主线程调用）。"""
+        if self._scheduler.running:
+            nxt = self._scheduler.next_run
+            nxt_txt = nxt.strftime("%Y-%m-%d %H:%M:%S") if nxt else "待定"
+            self._schedule_status_var.set(f"定时任务：运行中，下次触发：{nxt_txt}")
+        else:
+            self._schedule_status_var.set("定时任务：未启动")
+
+    def _on_schedule_fire(self):
+        """定时触发入口（APScheduler 后台线程）：按当前界面配置执行一次检测。"""
+        if self._schedule_running:
+            self._post_text("\n[定时任务] 上一轮检测尚未结束，本次触发跳过。\n")
+            return
+        try:
+            log_path = os.path.abspath(self.log_var.get().strip())
+            out_dir = os.path.abspath(self.out_var.get().strip())
+            params = self._parse_params()
+        except ValueError as exc:
+            self._post_text(f"\n[定时任务] 配置无效，本次跳过：{exc}\n")
+            return
+        self._schedule_running = True
+        threading.Thread(
+            target=self._scheduled_worker,
+            args=(log_path, out_dir, params),
+            daemon=True,
+        ).start()
+
+    def _scheduled_worker(self, log_path, out_dir, params):
+        """定时任务的后台执行：与手动检测共用同一检测流程。"""
+        text, status = self._run_detection(log_path, out_dir, params)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._post_text(f"\n===== 定时任务触发 {stamp}（运行{status}）=====\n{text}")
+        self._schedule_running = False
+        try:
+            self.root.after(0, self._update_schedule_status)
+        except RuntimeError:
+            pass
+
+    def _post_text(self, text):
+        """把文本追加到输出区（任意线程可安全调用）。"""
         def do():
-            self.output_box.insert("end", buf.getvalue())
+            self.output_box.insert("end", text)
             self.output_box.see("end")
-            self.run_btn.config(state="normal")
-            self.root.title(f"停车场异常车辆检测 - {status}")
         try:
             self.root.after(0, do)
+        except RuntimeError:
+            pass
+
+    # ---------------- 系统托盘 ----------------
+    def _setup_tray(self):
+        """初始化系统托盘图标（pystray）；不可用时回退为普通最小化。"""
+        try:
+            import pystray
+            from PIL import Image, ImageDraw
+        except ImportError:
+            return
+        # 生成托盘图标：蓝色圆角底 + 白色 P（默认字体不支持中文，故用 ASCII）
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((2, 2, 62, 62), radius=12, fill="#2f6fed")
+        draw.text((18, 14), "P", fill="white")
+        menu = pystray.Menu(
+            pystray.MenuItem("显示主窗口", self._tray_show),
+            pystray.MenuItem("退出程序", self._tray_quit),
+        )
+        self._tray_icon = pystray.Icon("parkcheck", img, "停车场异常车辆检测", menu)
+        threading.Thread(target=self._tray_icon.run, daemon=True).start()
+        self._tray_available = True
+
+    def _tray_show(self, icon=None, item=None):
+        """托盘菜单：显示主窗口。"""
+        try:
+            self.root.after(0, self._show_main_window)
+        except RuntimeError:
+            pass
+
+    def _tray_quit(self, icon=None, item=None):
+        """托盘菜单：完全退出程序。"""
+        try:
+            self.root.after(0, self._quit_app)
+        except RuntimeError:
+            pass
+
+    def _show_main_window(self):
+        """从托盘恢复并置前主窗口。"""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _on_close(self):
+        """关闭按钮：收纳到系统托盘继续后台运行；托盘不可用时最小化到任务栏。"""
+        if self._tray_available:
+            self.root.withdraw()
+            if not self._hidden_to_tray:
+                self._hidden_to_tray = True
+                try:
+                    self._tray_icon.notify(
+                        "程序已最小化到系统托盘，双击图标可重新打开。", "停车场异常车辆检测"
+                    )
+                except Exception:
+                    pass
+        else:
+            self.root.iconify()
+
+    def _quit_app(self):
+        """完全退出：停止调度器、移除托盘图标并关闭窗口。"""
+        self._scheduler.stop()
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+        try:
+            self.root.destroy()
         except RuntimeError:
             pass
 
