@@ -33,7 +33,9 @@ import sys
 KEY_OUT_PROCESS = "出场处理"        # 出场处理标识
 KEY_NO_GATE = "开闸结果：不开闸"     # 不开闸标识
 KEY_PAY_DOWN = "==>支付结果下发："   # 支付结果下发标识
+KEY_FEE = "用户需支付费用"           # 用户需支付费用标识
 WINDOW_SECONDS = 300               # 判定窗口：出场后多少秒内算正常
+FEE_LINK_WINDOW = 60               # 出场记录与其"需支付费用"行的最大间隔秒数
 DEFAULT_OUT_DIR = "output"         # 默认输出目录（不放入 document，且加入 .gitignore）
 
 # ---------- 工具函数 ----------
@@ -58,6 +60,14 @@ LINE_TS_RE = re.compile(r"^(\d{2}:\d{2}:\d{2})\s*-\s*(.*)$")
 PLATE_RE = re.compile(r"车牌《([^》]+)》")
 # 从支付下发 JSON 中提取 carNumber 车牌（容错：JSON 解析失败时用正则兜底）
 CARD_NO_RE = re.compile(r'"carNumber"\s*:\s*"([^"]+)"')
+# 提取"用户需支付费用"金额，形如：用户需支付费用:692.00
+FEE_RE = re.compile(r"用户需支付费用[:：]\s*([\d.]+)")
+
+
+def extract_fee(text):
+    """从文本中提取需支付金额（字符串），取不到返回 None。"""
+    m = FEE_RE.search(text)
+    return m.group(1) if m else None
 
 
 def normalize_car(car):
@@ -97,16 +107,28 @@ def extract_pay_car(text):
     return m.group(1).strip() if m else None
 
 
-def parse_log(file_path):
+def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW):
     """
     解析日志，返回 (record_a_list, record_b_list)
-      record_a: [{time:'HH:MM:SS', seconds:int, car:str}]  出场不开闸记录
+      record_a: [{time:'HH:MM:SS', seconds:int, car:str, fee:str|None}]
+                出场不开闸记录（fee 为该车本次出场"用户需支付费用"）
       record_b: [{time:'HH:MM:SS', seconds:int, car:str}]  支付结果下发记录
     """
     record_a = []
     record_b = []
     current_time = None          # 最近一条带时间戳行的时刻
     current_seconds = None
+    last_fee_seconds = None      # 最近一条"用户需支付费用"行的时刻(秒)
+    last_fee = None              # 最近一条"用户需支付费用"金额
+
+    def reset_fee(sec):
+        """费用行出现时更新最近费用与时刻。"""
+        nonlocal last_fee, last_fee_seconds
+        last_fee, last_fee_seconds = None, None
+        if sec is not None:
+            fee = extract_fee(content)
+            if fee is not None:
+                last_fee, last_fee_seconds = fee, sec
 
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
@@ -128,10 +150,18 @@ def parse_log(file_path):
             if KEY_OUT_PROCESS in content and KEY_NO_GATE in content:
                 car = normalize_car(extract_plate(content))
                 if car and current_seconds is not None:
+                    # 关联本车本次出场的需支付费用：
+                    # 取"最近一条费用"，要求其在出场时刻之前且间隔在阈值内
+                    fee = None
+                    if last_fee is not None and last_fee_seconds is not None:
+                        gap = current_seconds - last_fee_seconds
+                        if 0 <= gap <= fee_link_window:
+                            fee = last_fee
                     record_a.append({
                         "time": current_time,
                         "seconds": current_seconds,
                         "car": car,
+                        "fee": fee,
                     })
 
             # 记录B：支付结果下发
@@ -144,6 +174,10 @@ def parse_log(file_path):
                         "car": car,
                     })
 
+            # 用户需支付费用行：更新最近费用（放在记录A之后判断，费用行本身非记录A/B）
+            if KEY_FEE in content:
+                reset_fee(current_seconds)
+
     return record_a, record_b
 
 
@@ -151,7 +185,9 @@ def find_anomalies(record_a, record_b, window_seconds):
     """
     判定异常：对每条不开闸记录，在支付下发记录中查找
     车牌相同 且 时间 ∈ [T, T+window_seconds] 秒。
-    返回不存在该记录的【时间, 车牌】列表。
+    返回不存在该记录的【时间, 车牌, 需支付费用】列表。
+
+    规则：若找不到该车应交金额（fee 为空），该车不算可疑，直接排除。
     """
     abnormal = []
     # 按车牌建立索引，加速查询
@@ -165,8 +201,13 @@ def find_anomalies(record_a, record_b, window_seconds):
             ra["seconds"] <= s <= ra["seconds"] + window_seconds
             for s in candidates
         )
-        if not matched:
-            abnormal.append({"time": ra["time"], "car": ra["car"]})
+        # 仅当"无支付下发匹配 且 能取到应交金额"时才判为可疑
+        if not matched and ra.get("fee") is not None:
+            abnormal.append({
+                "time": ra["time"],
+                "car": ra["car"],
+                "fee": ra.get("fee"),
+            })
     return abnormal
 
 
@@ -191,16 +232,18 @@ def output_results(abnormal, log_path, out_dir):
     print(f"处理日志：{log_path}")
     print(f"识别异常车辆数：{len(abnormal)}")
     print("=" * 60)
-    print(f"{'出场时间':<10}   {'车牌号'}")
+    print(f"{'出场时间':<10}   {'车牌号':<10} {'用户需支付费用'}")
     print("-" * 60)
 
     # 写 CSV
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["出场时间", "车牌号"])
+        writer.writerow(["出场时间", "车牌号", "用户需支付费用"])
         for item in abnormal:
-            print(f"{item['time']:<8}   {item['car']}")
-            writer.writerow([item["time"], item["car"]])
+            fee = item.get("fee")
+            fee_txt = fee if fee is not None else "-"
+            print(f"{item['time']:<8}   {item['car']:<12} {fee_txt}")
+            writer.writerow([item["time"], item["car"], fee_txt])
 
     print("-" * 60)
     print(f"导出文件：{csv_path}")
