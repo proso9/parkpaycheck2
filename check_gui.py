@@ -79,6 +79,7 @@ class CheckGui:
         self._hidden_to_tray = False           # 是否已提示过收纳信息
 
         self._build_widgets()
+        self._set_window_icon()   # 主窗口图标与托盘一致
         self._setup_tray()
         # 关闭按钮：收纳到系统托盘（后台定时任务继续运行），托盘菜单可完全退出
         root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -536,19 +537,46 @@ class CheckGui:
         except RuntimeError:
             pass
 
+    # ---------------- 应用图标（托盘 + 主窗口共用） ----------------
+    def _make_icon_image(self):
+        """生成蓝底白 P 的图标图片（PIL Image，供托盘与主窗口复用）。"""
+        from PIL import Image, ImageFont, ImageDraw
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # 蓝色正方形底（四周留 1px 透明边，避免贴边不清晰）
+        draw.rectangle((1, 1, 62, 62), fill="#2f6fed")
+        # 优先使用系统字体放大 P，失败则退回默认字体（默认字体不支持中文，故用 ASCII）
+        try:
+            font = ImageFont.truetype("arial.ttf", 55)
+        except (OSError, Exception):
+            font = ImageFont.load_default()
+        # 把文本水平垂直居中
+        text = "P"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        pos = ((64 - tw) / 2 - bbox[0], (64 - th) / 2 - bbox[1])
+        draw.text(pos, text, fill="white", font=font)
+        return img
+
+    def _set_window_icon(self):
+        """为主窗口设置应用图标（与托盘一致的蓝底白 P）。"""
+        try:
+            from PIL import ImageTk
+        except ImportError:
+            return
+        icon_img = ImageTk.PhotoImage(self._make_icon_image())
+        # 保留引用，避免被垃圾回收导致图标消失
+        self._window_icon = icon_img
+        self.root.iconphoto(True, icon_img)
+
     # ---------------- 系统托盘 ----------------
     def _setup_tray(self):
         """初始化系统托盘图标（pystray）；不可用时回退为普通最小化。"""
         try:
             import pystray
-            from PIL import Image, ImageDraw
         except ImportError:
             return
-        # 生成托盘图标：蓝色圆角底 + 白色 P（默认字体不支持中文，故用 ASCII）
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        draw.rounded_rectangle((2, 2, 62, 62), radius=12, fill="#2f6fed")
-        draw.text((18, 14), "P", fill="white")
+        img = self._make_icon_image()
         menu = pystray.Menu(
             pystray.MenuItem("显示主窗口", self._tray_show),
             pystray.MenuItem("退出程序", self._tray_quit),
