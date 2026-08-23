@@ -21,7 +21,9 @@ from .config import (
     KEY_PAY_DOWN,
     KEY_FEE,
     KEY_ENTRY,
+    KEY_PARK_TIME,
     FEE_LINK_WINDOW,
+    PARK_TIME_LINK_WINDOW,
 )
 
 # 带时间戳前缀的行：分组1=时间, 分组2=内容
@@ -34,6 +36,12 @@ CARD_NO_RE = re.compile(r'"carNumber"\s*:\s*"([^"]+)"')
 FEE_RE = re.compile(r"用户需支付费用[:：]\s*([\d.]+)")
 # 提取入场车牌号，形如：入场车牌号：川AHT168，入场车牌类型：…
 ENTRY_RE = re.compile(r"入场车牌号[:：]\s*([^，,]+)")
+# 提取相机扫描行中的车牌，形如：…,车牌号：川GF2S38,内外场：…
+CAM_PLATE_RE = re.compile(r"车牌号[:：]\s*([^，,]+)")
+# 相机扫描方向，形如：方向：入口 / 方向：出口（含"重复上传"等前缀行）
+DIR_IN_RE = re.compile(r"方向[:：]\s*入口")
+# 提取停车时间，形如：停车时间:4天,剩余:1418分钟 → (天, 分钟)
+PARK_TIME_RE = re.compile(r"停车时间[:：]\s*(\d+)\s*天[，,]\s*剩余[:：]?\s*(\d+)\s*分钟")
 
 
 def time_to_seconds(t_str):
@@ -99,11 +107,37 @@ def extract_entry_plate(text):
     return m.group(1).strip() if m else None
 
 
-def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW):
+def extract_cam_plate(text):
+    """从相机扫描行中提取"车牌号"字段（归一化前原始值），取不到返回 None。"""
+    m = CAM_PLATE_RE.search(text)
+    return m.group(1).strip() if m else None
+
+
+def extract_park_minutes(text):
+    """从文本中提取系统"停车时间"，换算成总分钟数；取不到返回 None。
+
+    形如 "停车时间:4天,剩余:1418分钟" → 4*24*60 + 1418 = 7178 分钟。
+    用于与"入场→出场"实际时长比较，判断是否存在被遥控放行等可疑情况。
+    """
+    m = PARK_TIME_RE.search(text)
+    if not m:
+        return None
+    try:
+        days = int(m.group(1))
+        minutes = int(m.group(2))
+    except ValueError:
+        return None
+    return days * 24 * 60 + minutes
+
+
+def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW,
+              park_time_link_window=PARK_TIME_LINK_WINDOW):
     """
     解析日志，返回 (record_a_list, record_b_list, record_entry_list)
-      record_a: [{time:'HH:MM:SS', seconds:int, car:str, fee:str|None}]
-                出场不开闸记录（fee 为该车本次出场"用户需支付费用"）
+      record_a: [{time:'HH:MM:SS', seconds:int, car:str, fee:str|None,
+                  park_minutes:int|None}]
+                出场不开闸记录（fee 为该车本次出场"用户需支付费用"，
+                park_minutes 为该车本次出场的系统"停车时间"总分钟数）
       record_b: [{time:'HH:MM:SS', seconds:int, car:str}]  支付结果下发记录
       record_entry: [{time:'HH:MM:SS', seconds:int, car:str}]
                 入场记录（用于反查异常车辆入场时间）
@@ -115,6 +149,8 @@ def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW):
     current_seconds = None
     last_fee_seconds = None      # 最近一条"用户需支付费用"行的时刻(秒)
     last_fee = None              # 最近一条"用户需支付费用"金额
+    last_park_seconds = None     # 最近一条"停车时间"行的时刻(秒)
+    last_park_minutes = None     # 最近一条"停车时间"总分钟数
 
     def reset_fee(sec):
         """费用行出现时更新最近费用与时刻。"""
@@ -152,11 +188,19 @@ def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW):
                         gap = current_seconds - last_fee_seconds
                         if 0 <= gap <= fee_link_window:
                             fee = last_fee
+                    # 关联本车本次出场的系统"停车时间"总分钟数：
+                    # 取"最近一条停车时间"，要求其在出场时刻之前且间隔在阈值内
+                    park_minutes = None
+                    if last_park_minutes is not None and last_park_seconds is not None:
+                        gap = current_seconds - last_park_seconds
+                        if 0 <= gap <= park_time_link_window:
+                            park_minutes = last_park_minutes
                     record_a.append({
                         "time": current_time,
                         "seconds": current_seconds,
                         "car": car,
                         "fee": fee,
+                        "park_minutes": park_minutes,
                     })
 
             # 记录B：支付结果下发
@@ -169,7 +213,17 @@ def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW):
                         "car": car,
                     })
 
-            # 入场记录：记录该车的入场时刻（用于反查异常车辆入场时间）
+            # 入场事件：相机"方向：入口"扫描（含重复上传），或"入场车牌号"行兜底。
+            # 同一辆车被多机位重复扫到也会在此被重复记录，
+            # 由 detector 按 ENTRY_DEDUP_WINDOW 归并并取第一次。
+            if DIR_IN_RE.search(content):
+                car = normalize_car(extract_cam_plate(content))
+                if car and current_seconds is not None:
+                    record_entry.append({
+                        "time": current_time,
+                        "seconds": current_seconds,
+                        "car": car,
+                    })
             if KEY_ENTRY in content:
                 car = normalize_car(extract_entry_plate(content))
                 if car and current_seconds is not None:
@@ -182,5 +236,11 @@ def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW):
             # 用户需支付费用行：更新最近费用（放在记录A之后判断，费用行本身非记录A/B）
             if KEY_FEE in content:
                 reset_fee(current_seconds)
+
+            # 停车时间行：更新最近停车时间（该行为出场相机扫描后的业务行）
+            if KEY_PARK_TIME in content:
+                pm = extract_park_minutes(content)
+                if pm is not None and current_seconds is not None:
+                    last_park_minutes, last_park_seconds = pm, current_seconds
 
     return record_a, record_b, record_entry

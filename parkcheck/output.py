@@ -32,19 +32,20 @@ def output_results(abnormal, log_path, out_dir):
     print(f"处理日志：{log_path}")
     print(f"识别异常车辆数：{len(abnormal)}")
     print("=" * 60)
-    print(f"{'入场时间':<10}{'出场时间':<10}   {'车牌号':<10} {'用户需支付费用'}")
+    print(f"{'入场时间':<10}{'出场时间':<10}   {'车牌号':<10} {'用户需支付费用':<12}{'异常'}")
     print("-" * 60)
 
     # 写 CSV
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["入场时间", "出场时间", "车牌号", "用户需支付费用"])
+        writer.writerow(["入场时间", "出场时间", "车牌号", "用户需支付费用", "异常"])
         for item in abnormal:
             fee = item.get("fee")
             fee_txt = fee if fee is not None else "-"
             entry = item.get("entry_time", ENTRY_MARK_MISSING)
-            print(f"{entry:<10}{item['time']:<8}   {item['car']:<12} {fee_txt}")
-            writer.writerow([entry, item["time"], item["car"], fee_txt])
+            anomaly = item.get("anomaly", 0)
+            print(f"{entry:<10}{item['time']:<8}   {item['car']:<12} {fee_txt:<12} {anomaly}")
+            writer.writerow([entry, item["time"], item["car"], fee_txt, anomaly])
 
     print("-" * 60)
     print(f"导出文件：{csv_path}")
