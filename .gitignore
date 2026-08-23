@@ -1,0 +1,48 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# IDE 及操作系统
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# 项目数据目录（日志文件及输出结果）
+data/input/*.log
+data/input/*.txt
+data/output/
+logs/*.log
+logs/*.out
+
+# 保留空目录结构（使文件夹能被提交到仓库）
+!data/output/.gitkeep
+!logs/.gitkeep
+
+# 本地配置文件（含绝对路径或密钥）
+config/settings.yaml
+config/*.local.yaml
+*.secret.yaml
+
+# 运行时临时文件
+*.lock
+*.pid
+.pytest_cache/
+.coverage
+
+# 开发文档
+document/
