@@ -22,8 +22,6 @@ from .config import (
     KEY_FEE,
     KEY_ENTRY,
     KEY_PARK_TIME,
-    FEE_LINK_WINDOW,
-    PARK_TIME_LINK_WINDOW,
 )
 
 # 带时间戳前缀的行：分组1=时间, 分组2=内容
@@ -130,14 +128,15 @@ def extract_park_minutes(text):
     return days * 24 * 60 + minutes
 
 
-def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW,
-              park_time_link_window=PARK_TIME_LINK_WINDOW):
+def parse_log(file_path):
     """
     解析日志，返回 (record_a_list, record_b_list, record_entry_list)
       record_a: [{time:'HH:MM:SS', seconds:int, car:str, fee:str|None,
                   park_minutes:int|None}]
                 出场不开闸记录（fee 为该车本次出场"用户需支付费用"，
-                park_minutes 为该车本次出场的系统"停车时间"总分钟数）
+                park_minutes 为该车本次出场的系统"停车时间"总分钟数。
+                费用/停车时间与出场相机识别同时出现，故按日志顺序直接
+                取最近一条（仅要求其时刻不晚于本出场），不再设关联窗口）
       record_b: [{time:'HH:MM:SS', seconds:int, car:str}]  支付结果下发记录
       record_entry: [{time:'HH:MM:SS', seconds:int, car:str}]
                 入场记录（用于反查异常车辆入场时间）
@@ -181,20 +180,16 @@ def parse_log(file_path, fee_link_window=FEE_LINK_WINDOW,
             if KEY_OUT_PROCESS in content and KEY_NO_GATE in content:
                 car = normalize_car(extract_plate(content))
                 if car and current_seconds is not None:
-                    # 关联本车本次出场的需支付费用：
-                    # 取"最近一条费用"，要求其在出场时刻之前且间隔在阈值内
+                    # 费用/停车时间行与出场相机识别同时出现，直接按日志顺序取最近一条；
+                    # 仅要求其时刻不晚于本次出场（当前秒数 >= 该行秒数），不再设关联窗口
                     fee = None
-                    if last_fee is not None and last_fee_seconds is not None:
-                        gap = current_seconds - last_fee_seconds
-                        if 0 <= gap <= fee_link_window:
-                            fee = last_fee
-                    # 关联本车本次出场的系统"停车时间"总分钟数：
-                    # 取"最近一条停车时间"，要求其在出场时刻之前且间隔在阈值内
+                    if (last_fee is not None and last_fee_seconds is not None
+                            and current_seconds >= last_fee_seconds):
+                        fee = last_fee
                     park_minutes = None
-                    if last_park_minutes is not None and last_park_seconds is not None:
-                        gap = current_seconds - last_park_seconds
-                        if 0 <= gap <= park_time_link_window:
-                            park_minutes = last_park_minutes
+                    if (last_park_minutes is not None and last_park_seconds is not None
+                            and current_seconds >= last_park_seconds):
+                        park_minutes = last_park_minutes
                     record_a.append({
                         "time": current_time,
                         "seconds": current_seconds,

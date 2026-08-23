@@ -14,7 +14,6 @@ parkcheck 包：停车场系统日志异常车辆检测。
 
 from .config import (
     WINDOW_SECONDS,
-    FEE_LINK_WINDOW,
     ENTRY_MARK_MISSING,
     DEFAULT_OUT_DIR,
 )
@@ -25,7 +24,6 @@ from .cli import main
 
 __all__ = [
     "WINDOW_SECONDS",
-    "FEE_LINK_WINDOW",
     "ENTRY_MARK_MISSING",
     "DEFAULT_OUT_DIR",
     "parse_log",

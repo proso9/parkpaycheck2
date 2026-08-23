@@ -12,7 +12,8 @@ from .config import ENTRY_MARK_MISSING, ENTRY_DEDUP_WINDOW, MIN_PARK_TIME_DEVIAT
 
 
 def find_anomalies(record_a, record_b, window_seconds, record_entry=None,
-                   entry_dedup_window=ENTRY_DEDUP_WINDOW):
+                   entry_dedup_window=ENTRY_DEDUP_WINDOW,
+                   min_deviation=MIN_PARK_TIME_DEVIATION):
     """
     判定异常：对每条不开闸记录，在支付下发记录中查找
     车牌相同 且 时间 ∈ [T, T+window_seconds] 秒。
@@ -63,7 +64,7 @@ def find_anomalies(record_a, record_b, window_seconds, record_entry=None,
                     entry_time = tm
                     entry_seconds = sec
                     break
-            anomaly = compute_anomaly(ra, entry_seconds)
+            anomaly = compute_anomaly(ra, entry_seconds, min_deviation)
             abnormal.append({
                 "time": ra["time"],
                 "car": ra["car"],
