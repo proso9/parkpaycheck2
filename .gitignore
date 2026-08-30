@@ -43,6 +43,7 @@ tests/
 config/settings.yaml
 config/*.local.yaml
 *.secret.yaml
+.env
 
 # 运行时临时文件
 *.lock
@@ -52,3 +53,4 @@ config/*.local.yaml
 
 # 开发文档
 document/
+docs/

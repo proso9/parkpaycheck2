@@ -7,6 +7,7 @@ parkcheck 包：停车场系统日志异常车辆检测。
   parser    日志解析
   detector  异常判定与入场反查
   output    结果输出
+  state     已处理文件状态（跳过未变化的已处理日志）
   scheduler 定时任务（APScheduler 封装）
   cli       命令行入口
 
@@ -17,10 +18,19 @@ from .config import (
     WINDOW_SECONDS,
     ENTRY_MARK_MISSING,
     DEFAULT_OUT_DIR,
+    PROCESSED_STATE_FILE,
 )
 from .parser import parse_log
 from .detector import find_anomalies
 from .output import output_results
+from .db import (
+    D1UploadError,
+    make_dedup_key,
+    build_upload_records,
+    upload_records,
+    is_upload_configured,
+)
+from .state import ProcessedState
 from .scheduler import SchedulerManager
 from .cli import main
 
@@ -28,9 +38,16 @@ __all__ = [
     "WINDOW_SECONDS",
     "ENTRY_MARK_MISSING",
     "DEFAULT_OUT_DIR",
+    "PROCESSED_STATE_FILE",
     "parse_log",
     "find_anomalies",
     "output_results",
+    "D1UploadError",
+    "make_dedup_key",
+    "build_upload_records",
+    "upload_records",
+    "is_upload_configured",
+    "ProcessedState",
     "SchedulerManager",
     "main",
 ]

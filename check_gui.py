@@ -40,6 +40,18 @@ from parkcheck.config import (
     MIN_PARK_TIME_DEVIATION,
     ENTRY_DEDUP_WINDOW,
     DEFAULT_OUT_DIR,
+    PROCESSED_STATE_FILE,
+    DB_BATCH_SIZE,
+    UPLOAD_ENABLED,
+    CF_ACCOUNT_ID,
+    CF_DATABASE_ID,
+    CF_API_TOKEN,
+)
+from parkcheck.db import (
+    D1UploadError,
+    build_upload_records,
+    upload_records,
+    is_upload_configured,
 )
 from parkcheck.scheduler import (
     SchedulerManager,
@@ -49,6 +61,7 @@ from parkcheck.scheduler import (
 from parkcheck.parser import parse_log
 from parkcheck.detector import find_anomalies
 from parkcheck.output import output_results
+from parkcheck.state import ProcessedState
 
 
 def collect_log_files(path):
@@ -61,6 +74,24 @@ def collect_log_files(path):
     if not files:
         return [], f"目录 {path} 下未找到 .log 文件"
     return files, None
+
+
+def upload_export_fields(enabled, account, database, batch):
+    """
+    上传配置中允许导出到 JSON 的字段（纯函数，便于测试）。
+
+    API Token 涉密，绝不包含在导出字段中；批量大小非法时回退默认值。
+    """
+    try:
+        batch = int(batch)
+    except (TypeError, ValueError):
+        batch = DB_BATCH_SIZE
+    return {
+        "upload_enabled": bool(enabled),
+        "cf_account": str(account).strip(),
+        "cf_database": str(database).strip(),
+        "db_batch": batch,
+    }
 
 
 class CheckGui:
@@ -110,23 +141,69 @@ class CheckGui:
         menubar.add_cascade(label="配置", menu=config_menu)
         self.root.config(menu=menubar)
 
-        # 分页：路径配置 / 判定参数 / 定时任务 / 运行输出
+        # 分页：路径配置 / 判定参数 / 定时任务 / 数据库上传 / 运行输出
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, **pad)
 
         tab_paths = ttk.Frame(notebook, padding=10)
         tab_params = ttk.Frame(notebook, padding=10)
         tab_sched = ttk.Frame(notebook, padding=10)
+        tab_upload = ttk.Frame(notebook, padding=10)
         tab_run = ttk.Frame(notebook, padding=10)
         notebook.add(tab_paths, text="路径配置")
         notebook.add(tab_params, text="判定参数")
         notebook.add(tab_sched, text="定时任务")
+        notebook.add(tab_upload, text="数据库上传")
         notebook.add(tab_run, text="运行与输出")
 
         self._build_paths_tab(tab_paths)
         self._build_params_tab(tab_params)
         self._build_schedule_tab(tab_sched)
+        self._build_upload_tab(tab_upload)
         self._build_run_tab(tab_run)
+
+    def _build_upload_tab(self, parent):
+        """数据库上传页：开关 + Cloudflare D1 凭证 + 批量大小。
+
+        初始值来自 config 默认（可经环境变量/.env 提供），重启后免手填。
+        """
+        self._upload_enabled = tk.BooleanVar(value=bool(UPLOAD_ENABLED))
+        ttk.Checkbutton(
+            parent,
+            text="启用数据库上传（把异常记录上传到 Cloudflare D1，上传成功才标记日志已处理）",
+            variable=self._upload_enabled,
+        ).pack(anchor="w", pady=(4, 8))
+
+        account_row = ttk.Frame(parent)
+        account_row.pack(fill="x", pady=4)
+        self._cf_account = self._field_row(account_row, "账户 ID：", CF_ACCOUNT_ID)
+
+        database_row = ttk.Frame(parent)
+        database_row.pack(fill="x", pady=4)
+        self._cf_database = self._field_row(database_row, "数据库 ID：", CF_DATABASE_ID)
+
+        token_row = ttk.Frame(parent)
+        token_row.pack(fill="x", pady=4)
+        ttk.Label(token_row, text="API Token：").pack(side="left", padx=(0, 6))
+        self._cf_token = tk.StringVar(value=CF_API_TOKEN)
+        # Token 以掩码显示，且绝不随「导出配置」JSON 导出
+        ttk.Entry(token_row, textvariable=self._cf_token, width=28,
+                  show="*").pack(side="left", fill="x", expand=True)
+
+        batch_row = ttk.Frame(parent)
+        batch_row.pack(fill="x", pady=4)
+        ttk.Label(batch_row, text="批量大小：").pack(side="left")
+        self._db_batch = tk.StringVar(value=str(DB_BATCH_SIZE))
+        ttk.Spinbox(batch_row, from_=1, to=10000, width=8,
+                    textvariable=self._db_batch).pack(side="left")
+        ttk.Label(batch_row, text="（单次请求最多合并的记录数）").pack(side="left", padx=(6, 0))
+
+        ttk.Label(
+            parent,
+            text=("说明：需具备 D1:Edit 权限的 Cloudflare API Token；三凭证任一为空视为未配置上传。\n"
+                  "上传采用 INSERT OR IGNORE + 去重键，只插入新记录、永不覆盖，重复上传自动忽略。"),
+            foreground="#666666", wraplength=680, justify="left",
+        ).pack(anchor="w", pady=(12, 0))
 
     def _build_paths_tab(self, parent):
         """路径配置页：日志目录 + 输出目录。"""
@@ -145,27 +222,29 @@ class CheckGui:
         )
         ttk.Button(row2, text="浏览…", command=self._pick_out).pack(side="left", padx=(6, 0))
 
+        row3 = ttk.Frame(parent)
+        row3.pack(fill="x", pady=4)
+        self.skip_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row3,
+            text="排除已处理的日志文件（内容未变化的不再重复处理，仍在写入的日志会自动重新处理）",
+            variable=self.skip_var,
+        ).pack(anchor="w")
+
     def _build_params_tab(self, parent):
-        """判定参数页：判定窗口 / 停车时间偏差 / 入场去重窗口。"""
-        def spin_row(frame, label, default):
-            ttk.Label(frame, text=label, width=22).pack(side="left")
+        """判定参数页：判定窗口 / 停车时间偏差 / 入场去重窗口（纵向排列，文字左对齐）。"""
+        def spin_row(parent_, label, default):
+            row = ttk.Frame(parent_)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text=label).pack(side="left", anchor="w")
             var = tk.StringVar(value=str(default))
-            ttk.Spinbox(frame, from_=0, to=100000, width=8, textvariable=var).pack(side="left")
+            ttk.Spinbox(row, from_=0, to=100000, width=8,
+                        textvariable=var).pack(side="left", padx=(6, 0))
             return var
 
-        grid = ttk.Frame(parent)
-        grid.pack(fill="x", pady=4)
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-
-        left = ttk.Frame(grid)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=4)
-        right = ttk.Frame(grid)
-        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=4)
-
-        self.window_var = spin_row(left, "判定窗口(秒)", WINDOW_SECONDS)
-        self.dev_var = spin_row(right, "最小停车时间偏差(分钟)", MIN_PARK_TIME_DEVIATION)
-        self.dedup_var = spin_row(left, "入场去重窗口(秒)", ENTRY_DEDUP_WINDOW)
+        self.window_var = spin_row(parent, "判定窗口(秒)", WINDOW_SECONDS)
+        self.dev_var = spin_row(parent, "最小停车时间偏差(分钟)", MIN_PARK_TIME_DEVIATION)
+        self.dedup_var = spin_row(parent, "入场去重窗口(秒)", ENTRY_DEDUP_WINDOW)
 
     def _build_schedule_tab(self, parent):
         """定时任务页：开关 / 类型 / 间隔 / 每天时间 / 状态。"""
@@ -262,13 +341,28 @@ class CheckGui:
 5. 输出目录
    CSV 结果导出目录（使用绝对路径），不存在时自动创建。
 
-6. 定时任务（APScheduler）
+6. 排除已处理的日志文件
+   勾选后，内容未变化的已处理日志自动跳过，避免定时任务
+   重复处理旧日志；当天仍在追加写入的日志不受影响，会正常
+   重新检测。已处理记录保存在输出目录下的 .processed.json。
+
+7. 定时任务（APScheduler）
    勾选“启用定时任务”后，将按下方配置在后台自动定时检测：
    - 间隔运行：每隔 N 秒/分/时运行一次；
    - 每天固定时间：每天 HH:MM（如 08:00）运行一次。
    定时检测每次触发都会实时读取当前界面的路径与参数配置，
    修改后无需重启即生效；勾选框取消即停止。
    任务状态栏会显示“下次触发”时间，便于确认已生效。
+
+8. 数据库上传（Cloudflare D1）
+   勾选“启用数据库上传”后，每检测出一个日志文件的异常记录，
+   会先上传到 D1 再把该日志标记为已处理；上传失败不标记，
+   下一轮定时触发时自动重试（去重键幂等，不产生重复数据）。
+   - 账户 ID / 数据库 ID / API Token 三者任一为空视为未配置上传；
+   - API Token 需具备 D1:Edit 权限，仅保存在本机内存中，
+     绝不随「导出配置」JSON 导出，导入配置时也会忽略该字段；
+   - 上传只插入新记录（INSERT OR IGNORE），已有记录的
+     处理状态/备注（由展示项目维护）不会被本工具修改。
 
 费用与系统“停车时间”与出场相机识别同时出现，直接按时间取最近一条，无需单独配置。"""
 
@@ -299,6 +393,7 @@ class CheckGui:
         data = {
             "log_dir": self.log_var.get().strip(),
             "out_dir": self.out_var.get().strip(),
+            "skip_processed": bool(self.skip_var.get()),
             "window": self._read_int(self.window_var, "判定窗口"),
             "deviation": self._read_int(self.dev_var, "最小停车时间偏差"),
             "dedup": self._read_int(self.dedup_var, "入场去重窗口"),
@@ -308,6 +403,17 @@ class CheckGui:
             "schedule_unit": self._schedule_unit.get(),
             "schedule_time": self._schedule_time.get().strip(),
         }
+        # 上传配置（upload_export_fields 保证不含 API Token）
+        try:
+            batch = self._read_int(self._db_batch, "批量大小")
+        except ValueError:
+            batch = self._db_batch.get()
+        data.update(upload_export_fields(
+            self._upload_enabled.get(),
+            self._cf_account.get(),
+            self._cf_database.get(),
+            batch,
+        ))
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -334,6 +440,8 @@ class CheckGui:
             self.log_var.set(str(data["log_dir"]).strip() or self.log_var.get())
         if "out_dir" in data:
             self.out_var.set(str(data["out_dir"]).strip() or self.out_var.get())
+        if "skip_processed" in data:
+            self.skip_var.set(bool(data["skip_processed"]))
         for key, var, label in (
             ("window", self.window_var, "判定窗口"),
             ("deviation", self.dev_var, "最小停车时间偏差"),
@@ -359,6 +467,18 @@ class CheckGui:
             self._schedule_unit.set(data["schedule_unit"])
         if "schedule_time" in data:
             self._schedule_time.set(str(data["schedule_time"]).strip() or self._schedule_time.get())
+        # 数据库上传配置（cf_token 涉密，导入时忽略该字段，绝不恢复）
+        if "upload_enabled" in data:
+            self._upload_enabled.set(bool(data["upload_enabled"]))
+        if "cf_account" in data:
+            self._cf_account.set(str(data["cf_account"]).strip())
+        if "cf_database" in data:
+            self._cf_database.set(str(data["cf_database"]).strip())
+        if "db_batch" in data:
+            try:
+                self._db_batch.set(str(int(data["db_batch"])))
+            except (TypeError, ValueError):
+                pass
         # 应用定时开关：导入后按配置启动/停止
         if self._schedule_enabled.get():
             self._start_schedule()
@@ -379,6 +499,16 @@ class CheckGui:
             "dedup": self._read_int(self.dedup_var, "入场去重窗口"),
         }
 
+    def _read_upload_cfg(self):
+        """从界面读取数据库上传配置（定时任务每次触发都会实时调用）。"""
+        return {
+            "enabled": bool(self._upload_enabled.get()),
+            "cf_account": self._cf_account.get().strip(),
+            "cf_database": self._cf_database.get().strip(),
+            "cf_token": self._cf_token.get().strip(),
+            "db_batch": self._read_int(self._db_batch, "批量大小"),
+        }
+
     def _start(self):
         """校验输入后启动后台线程执行。"""
         # 统一转成绝对路径，避免相对路径受当前工作目录影响
@@ -392,6 +522,7 @@ class CheckGui:
             return
         try:
             params = self._parse_params()
+            upload_cfg = self._read_upload_cfg()
         except ValueError as exc:
             messagebox.showerror("参数错误", str(exc))
             return
@@ -400,17 +531,25 @@ class CheckGui:
         self._clear_output()
         threading.Thread(
             target=self._run_worker,
-            args=(log_path, out_dir, params),
+            args=(log_path, out_dir, params, self.skip_var.get(), upload_cfg),
             daemon=True,
         ).start()
 
-    def _run_worker(self, log_path, out_dir, params):
+    def _run_worker(self, log_path, out_dir, params, skip_processed, upload_cfg=None):
         """后台执行处理流程，捕获标准输出回显到界面。"""
-        text, status = self._run_detection(log_path, out_dir, params)
+        text, status = self._run_detection(log_path, out_dir, params,
+                                           skip_processed, upload_cfg)
         self._finish(text, f"运行{status}")
 
-    def _run_detection(self, log_path, out_dir, params):
-        """执行检测流程（纯计算，后台线程可调用），返回 (输出文本, 状态)。"""
+    def _run_detection(self, log_path, out_dir, params, skip_processed=True,
+                       upload_cfg=None):
+        """
+        执行检测流程（纯计算，后台线程可调用），返回 (输出文本, 状态)。
+
+        upload_cfg 开启且配置完整时，每个日志文件检测完成后先上传 D1，
+        上传成功才标记已处理；单个文件上传失败不中断整轮，该文件不标记，
+        下轮（含定时触发）会自动重新检测并重试（去重键幂等，不产生重复）。
+        """
         buf = StringIO()
         try:
             with redirect_stdout(buf):
@@ -418,15 +557,50 @@ class CheckGui:
                 if err:
                     print(err)
                     return buf.getvalue(), "失败"
+                # 开关开启但凭证不全：视为未配置上传（等同关闭），只提示一次
+                if upload_cfg and upload_cfg.get("enabled") \
+                        and not is_upload_configured(upload_cfg):
+                    print("提示：已开启数据库上传，但 Cloudflare 账户 ID / 数据库 ID / "
+                          "API Token 未配置完整，本次运行不上传。")
+                    upload_cfg = dict(upload_cfg, enabled=False)
+                # 已处理状态表（存放在输出目录下）：内容未变化的日志不再重复处理
+                state = ProcessedState(
+                    os.path.join(out_dir, PROCESSED_STATE_FILE)
+                ) if skip_processed else None
+                processed = skipped = failed = 0
                 for path in files:
-                    record_a, record_b, record_entry = parse_log(path)
-                    abnormal = find_anomalies(
-                        record_a, record_b, params["window"], record_entry,
-                        entry_dedup_window=params["dedup"],
-                        min_deviation=params["deviation"],
-                    )
-                    output_results(abnormal, path, out_dir)
-                print("\n全部处理完成。")
+                    if state is not None and state.is_processed(path):
+                        skipped += 1
+                        print(f"跳过已处理（内容未变化）：{path}")
+                        continue
+                    try:
+                        record_a, record_b, record_entry = parse_log(path)
+                        abnormal = find_anomalies(
+                            record_a, record_b, params["window"], record_entry,
+                            entry_dedup_window=params["dedup"],
+                            min_deviation=params["deviation"],
+                        )
+                        output_results(abnormal, path, out_dir)
+                        if upload_cfg and upload_cfg.get("enabled"):
+                            records = build_upload_records(abnormal, path)
+                            inserted = upload_records(records, upload_cfg)
+                            print(f"已上传 {len(records)} 条异常记录到 D1"
+                                  f"（新插入 {inserted} 条）。")
+                    except D1UploadError as exc:
+                        # 上传失败：不标记已处理，继续下一个文件，下轮自动重试
+                        failed += 1
+                        print(f"上传失败（本轮不标记已处理，下轮将自动重试）：{path}\n错误：{exc}")
+                        continue
+                    # 上传成功（或未开启上传）才落盘状态，中途中断也不丢失进度
+                    if state is not None:
+                        state.mark(path)
+                        state.save()
+                    processed += 1
+                summary = (f"\n全部处理完成：本次处理 {processed} 个日志，"
+                           f"跳过已处理 {skipped} 个。")
+                if failed:
+                    summary += f"上传失败 {failed} 个（未标记已处理，下轮自动重试）。"
+                print(summary)
         except Exception as exc:  # 界面层兜底，避免后台线程静默崩溃
             buf.write(f"\n发生错误：{exc}\n")
             return buf.getvalue(), "出错"
@@ -506,19 +680,22 @@ class CheckGui:
             log_path = os.path.abspath(self.log_var.get().strip())
             out_dir = os.path.abspath(self.out_var.get().strip())
             params = self._parse_params()
+            upload_cfg = self._read_upload_cfg()
         except ValueError as exc:
             self._post_text(f"\n[定时任务] 配置无效，本次跳过：{exc}\n")
             return
         self._schedule_running = True
         threading.Thread(
             target=self._scheduled_worker,
-            args=(log_path, out_dir, params),
+            args=(log_path, out_dir, params, self.skip_var.get(), upload_cfg),
             daemon=True,
         ).start()
 
-    def _scheduled_worker(self, log_path, out_dir, params):
-        """定时任务的后台执行：与手动检测共用同一检测流程。"""
-        text, status = self._run_detection(log_path, out_dir, params)
+    def _scheduled_worker(self, log_path, out_dir, params, skip_processed,
+                          upload_cfg=None):
+        """定时任务的后台执行：与手动检测共用同一检测流程（含数据库上传）。"""
+        text, status = self._run_detection(log_path, out_dir, params,
+                                           skip_processed, upload_cfg)
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         self._post_text(f"\n===== 定时任务触发 {stamp}（运行{status}）=====\n{text}")
         self._schedule_running = False

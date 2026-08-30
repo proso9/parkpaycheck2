@@ -2,21 +2,41 @@
 """
 命令行入口模块：解析命令行参数、收集日志文件并调度处理流程。
 
-统一编排：parse_log → find_anomalies → output_results。
+统一编排：parse_log → find_anomalies → output_results →（可选）上传 D1 → 标记已处理。
+
+上传失败（网络断开、Token 无效、库 ID 错误等）时不标记该日志已处理，
+打印明确错误后继续处理下一个文件；下一轮重新检测时靠 INSERT OR IGNORE
+去重键兜底重试，不产生重复数据。
 """
 
 import argparse
 import os
 import sys
 
-from .config import WINDOW_SECONDS, DEFAULT_OUT_DIR
+from .config import (
+    WINDOW_SECONDS,
+    DEFAULT_OUT_DIR,
+    PROCESSED_STATE_FILE,
+    UPLOAD_ENABLED,
+    CF_ACCOUNT_ID,
+    CF_DATABASE_ID,
+    CF_API_TOKEN,
+    DB_BATCH_SIZE,
+)
+from .db import (
+    D1UploadError,
+    build_upload_records,
+    upload_records,
+    is_upload_configured,
+)
 from .parser import parse_log
 from .detector import find_anomalies
 from .output import output_results
+from .state import ProcessedState
 
 
 def build_parser():
-    """构造命令行解析器，所有判定参数均可在此指定。"""
+    """构造命令行解析器，所有判定参数与上传配置均可在此指定。"""
     parser = argparse.ArgumentParser(
         description="停车场系统日志异常车辆检测：出场不开闸且窗口期无支付结果下发"
     )
@@ -31,6 +51,32 @@ def build_parser():
     parser.add_argument(
         "-o", "--out", default=DEFAULT_OUT_DIR,
         help=f"CSV 导出目录，默认 {DEFAULT_OUT_DIR}（项目根目录，已加入 .gitignore）"
+    )
+    parser.add_argument(
+        "--reprocess", action="store_true",
+        help="忽略已处理记录，强制重新处理所有日志"
+             "（默认跳过内容未变化的已处理日志，仍在追加写入的日志会自动重新处理）"
+    )
+    # ---------------- 数据库上传（Cloudflare D1） ----------------
+    parser.add_argument(
+        "--upload", action="store_true", default=UPLOAD_ENABLED,
+        help="启用把异常记录上传到 Cloudflare D1（默认关闭；上传成功才标记日志已处理）"
+    )
+    parser.add_argument(
+        "--cf-account", default=CF_ACCOUNT_ID,
+        help="Cloudflare Account ID（上传必需）"
+    )
+    parser.add_argument(
+        "--cf-database", default=CF_DATABASE_ID,
+        help="D1 Database UUID（上传必需）"
+    )
+    parser.add_argument(
+        "--cf-token", default=CF_API_TOKEN,
+        help="Cloudflare API Token（需 D1:Edit 权限；建议通过环境变量或 GUI 传入，避免留在命令历史）"
+    )
+    parser.add_argument(
+        "--db-batch", type=int, default=DB_BATCH_SIZE,
+        help=f"单次上传请求最多合并的记录数，默认 {DB_BATCH_SIZE}"
     )
     return parser
 
@@ -53,14 +99,90 @@ def collect_log_files(path):
     return log_files
 
 
+def build_upload_cfg(args):
+    """从命令行参数组装上传配置字典（供 db.upload_records 使用）。"""
+    return {
+        "enabled": bool(args.upload),
+        "cf_account": args.cf_account,
+        "cf_database": args.cf_database,
+        "cf_token": args.cf_token,
+        "db_batch": args.db_batch,
+    }
+
+
+def check_upload_cfg(upload_cfg):
+    """
+    校验上传配置：开关开启但凭证不全时，视为未配置上传（等同开关关闭），
+    打印一次提示并返回关闭上传的新配置；配置完整则原样返回。
+    """
+    if upload_cfg.get("enabled") and not is_upload_configured(upload_cfg):
+        print("提示：已开启数据库上传，但 Cloudflare 账户 ID / 数据库 ID / API Token "
+              "未配置完整，本次运行不上传。")
+        return dict(upload_cfg, enabled=False)
+    return upload_cfg
+
+
+def process_log_file(path, out_dir, window, upload_cfg=None, state=None,
+                     upload_fn=None):
+    """
+    处理单个日志文件：检测 → 输出 CSV →（可选）上传 D1 → 标记已处理。
+
+    上传开启时：先上传后标记，上传失败抛出 D1UploadError（本函数不捕获），
+    调用方据此保证"上传成功才标记已处理"。upload_fn 仅供测试注入 mock。
+    返回 (异常记录列表, 新插入行数或 None)。
+    """
+    record_a, record_b, record_entry = parse_log(path)
+    abnormal = find_anomalies(record_a, record_b, window, record_entry)
+    output_results(abnormal, path, out_dir)
+
+    inserted = None
+    if upload_cfg and upload_cfg.get("enabled"):
+        records = build_upload_records(abnormal, path)
+        if upload_fn is None:
+            upload_fn = upload_records
+        inserted = upload_fn(records, upload_cfg)
+        print(f"已上传 {len(records)} 条异常记录到 D1（新插入 {inserted} 条）。")
+
+    # 上传成功（或未开启上传）才标记已处理；上传失败时不走到这里
+    if state is not None:
+        state.mark(path)
+        state.save()
+    return abnormal, inserted
+
+
 def main():
     args = build_parser().parse_args()
 
+    upload_cfg = check_upload_cfg(build_upload_cfg(args))
+
+    # 已处理状态表（存放在输出目录下）：内容未变化的日志不再重复处理
+    state = None if args.reprocess else ProcessedState(
+        os.path.join(args.out, PROCESSED_STATE_FILE)
+    )
+
+    processed = skipped = failed = 0
     # 逐个处理日志文件
     for path in collect_log_files(args.log):
-        record_a, record_b, record_entry = parse_log(path)
-        abnormal = find_anomalies(record_a, record_b, args.window, record_entry)
-        output_results(abnormal, path, args.out)
+        if state is not None and state.is_processed(path):
+            skipped += 1
+            print(f"跳过已处理（内容未变化）：{path}")
+            continue
+        try:
+            process_log_file(path, args.out, args.window,
+                             upload_cfg=upload_cfg, state=state)
+        except D1UploadError as exc:
+            # 上传失败：不标记已处理，下轮自动重试（去重键兜底不产生重复）
+            failed += 1
+            print(f"上传失败（本轮不标记已处理，下轮将自动重试）：{path}\n错误：{exc}")
+            continue
+        # 每处理完一个文件立即落盘，中途中断也不丢失进度
+        processed += 1
+
+    if state is not None:
+        summary = f"本次处理 {processed} 个日志，跳过已处理 {skipped} 个。"
+        if failed:
+            summary += f"上传失败 {failed} 个（未标记已处理，下轮自动重试）。"
+        print(summary)
 
 
 if __name__ == "__main__":

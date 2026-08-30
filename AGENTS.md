@@ -14,17 +14,25 @@ parkpaycheck_v2/
 ├── README.md                       # 项目介绍、使用说明与依赖安装命令
 ├── check_unopened_gate.py          # 命令行入口（薄封装，调用 parkcheck.cli）
 ├── check_gui.py                    # 图形界面入口（tkinter 分页 + APScheduler + 系统托盘）
+├── .env.example                    # 本地密钥配置模板（复制为 .env 使用，.env 不入仓库）
+├── docs/                           # 需求文档等（如 需求文档_数据库上传.md）
 ├── parkcheck/                      # 检测包
 │   ├── __init__.py                 # 公共 API 聚合导出
-│   ├── config.py                   # 常量与默认参数
+│   ├── config.py                   # 常量与默认参数（上传配置支持环境变量/.env 覆盖）
+│   ├── env.py                      # .env 读取（仅标准库，加载进 os.environ）
 │   ├── parser.py                   # 日志解析
 │   ├── detector.py                 # 异常判定与入场反查
 │   ├── output.py                   # 结果输出（控制台 + CSV）
+│   ├── db.py                       # 数据库上传（Cloudflare D1 REST API，仅标准库）
+│   ├── state.py                    # 已处理文件状态（跳过未变化的已处理日志）
 │   ├── scheduler.py                # 定时任务（APScheduler 封装）
 │   └── cli.py                      # 命令行入口
 ├── tests/
 │   ├── test_check_unopened_gate.py # 核心逻辑无依赖断言式测试
-│   └── test_scheduler.py           # 定时任务模块测试（依赖 apscheduler）
+│   ├── test_scheduler.py           # 定时任务模块测试（依赖 apscheduler）
+│   ├── test_state.py               # 已处理状态模块测试（无依赖）
+│   ├── test_db.py                  # 数据库上传模块测试（无依赖，HTTP 层 mock）
+│   └── test_env.py                 # .env 读取模块测试（无依赖）
 ├── document/                       # 日志样例(输入, 不入库)
 │   └── system.<日期>.log
 └── output/                         # 脚本导出的 CSV(不入库, 自动创建)
@@ -41,7 +49,7 @@ parkpaycheck_v2/
 4. **入场反查**（`detector.find_anomalies`）：以相机`方向：入口`扫描（含重复上传）作为入场事件来源，`入场车牌号`行兜底；同一辆车 5 秒内的重复入口扫描归并为同一次入场并取第一次，本次出场取之前最近一次入场事件的时间；无匹配入场用 `-` 标记（窗口 `ENTRY_DEDUP_WINDOW` 可调）。
 5. **可疑标记**（`detector.compute_anomaly`）：解析出场相机扫描后的"停车时间:X天,剩余:Y分钟"，换算成总分钟数；与"入场→出场"实际时长比较，仅当系统停车时间**明显**大于实际时长（至少多出 `MIN_PARK_TIME_DEVIATION` 分钟，如被门卫遥控放行）时在输出中标记"异常"为 1，否则为 0。
 
-各模块职责：`config.py` 存放关键词与参数默认值，`parser.py` 负责时间/车牌/费用/入场提取与拆行，`detector.py` 负责异常判定与入场反查，`output.py` 负责控制台与 CSV 输出。
+各模块职责：`config.py` 存放关键词与参数默认值，`parser.py` 负责时间/车牌/费用/入场提取与拆行，`detector.py` 负责异常判定与入场反查，`output.py` 负责控制台与 CSV 输出，`db.py` 负责 Cloudflare D1 上传（REST API 客户端、建表、去重键、批量插入），`state.py` 负责已处理日志文件的状态记录与排除。
 
 关键实现点：
 
@@ -55,6 +63,18 @@ parkpaycheck_v2/
 
 输出列：`入场时间, 出场时间, 车牌号, 用户需支付费用, 异常`（入场时间找不到显示 `-`，无关联费用显示 `-`；“异常”为 1 表示系统停车时间明显大于实际时长，可疑）。
 
+## 数据库上传（Cloudflare D1）
+
+可选功能（默认关闭，需求见 `docs/需求文档_数据库上传.md`）：把异常记录上传到 Cloudflare D1 数据库，供另一独立项目读取展示。实现要点：
+
+- **仅标准库**：`parkcheck/db.py` 用 `urllib.request` 直接调 D1 REST API（`POST /accounts/{id}/d1/database/{id}/query`），不部署 Worker、不引入第三方依赖；HTTP 层通过 `opener` 参数注入，便于测试 mock。
+- **只插入新记录，永不覆盖**：`INSERT OR IGNORE` + 唯一去重键 `dedup_key = sha256("{log_file}|{exit_time}|{car_number}")`；本工具对已有记录不做任何 UPDATE，`status`/`remark`（0/NULL 默认值之外）由展示项目维护。
+- **表自动创建**：每次上传会话先发一次 `CREATE TABLE IF NOT EXISTS anomalies`（幂等）；日志内 `HH:MM:SS` 时间入库前用文件名日期补全为 `YYYY-MM-DD HH:MM:SS` 全格式；`entry_time`/`fee` 为 `-` 时存 `NULL`。
+- **上传成功才标记已处理**：上传开启时流程为 检测 → 输出 CSV → 上传 D1 → `state.mark()`；上传失败（网络/Token/库 ID 等错误）打印明确错误、不标记该日志、继续处理下一个文件，下一轮自动重试（去重键兜底不产生重复）。关闭上传时行为与无上传版本完全一致。
+- **配置**：`config.py` 默认值（`UPLOAD_ENABLED / CF_ACCOUNT_ID / CF_DATABASE_ID / CF_API_TOKEN / DB_BATCH_SIZE`），CLI 参数 `--upload --cf-account --cf-database --cf-token --db-batch` 可覆盖，GUI「数据库上传」页签可编辑。账户 ID / 数据库 ID / Token 任一为空视为未配置上传（等同关闭，提示一次）。
+- **本地密钥持久化（.env）**：`parkcheck/env.py`（仅标准库）在 `config.py` 导入时加载项目根目录 `.env`（可选，缺失静默忽略，已存在的环境变量不被覆盖）。上传 5 项配置优先级：**显式命令行参数 > 环境变量（含 .env）> config.py 默认值**；模板见 `.env.example`，`.env` 已加入 `.gitignore`，不入仓库、不随「导出配置」JSON 导出。
+- **API Token 安全**：Token 绝不随 GUI「导出配置」JSON 导出（见 `check_gui.upload_export_fields`），导入配置时忽略该字段。
+
 ## 命令行用法
 
 ```bash
@@ -67,11 +87,19 @@ python check_unopened_gate.py document\system.2026-08-22.log
 # 调整判定窗口(秒)与输出目录
 python check_unopened_gate.py -w 300 -o output
 
+# 忽略已处理记录，强制重新处理所有日志
+python check_unopened_gate.py --reprocess
+
+# 开启数据库上传（Cloudflare D1），上传成功才标记日志已处理
+python check_unopened_gate.py --upload --cf-account <账户ID> --cf-database <库ID> --cf-token <API_Token>
+
 # 也可通过模块方式运行
 python -m parkcheck.cli -w 300 -o output
 ```
 
 参数均在 `parkcheck/config.py` 定义默认值，并在 `parkcheck/cli.py` 的 argparse 中提供覆盖，未硬编码。
+
+**已处理日志排除**（`parkcheck/state.py`，CLI 与 GUI 默认启用）：已处理日志的状态（大小 + 修改时间）记录在输出目录下的 `.processed.json`，内容未变化的日志自动跳过；仍在追加写入的日志（如当天日志）不受影响，会正常重新检测。`--reprocess` 可忽略记录强制重跑；换输出目录即重新记录，互不干扰。
 
 ## 图形界面与定时任务
 
@@ -82,7 +110,9 @@ python check_gui.py
 
 图形界面（`check_gui.py`）在命令行能力基础上增加**分页配置**与**系统托盘后台运行**：
 
-- **分页配置**（`ttk.Notebook`）：路径配置 / 判定参数 / 定时任务 / 运行输出 四个页签，配置相互隔离、互不干扰。
+- 分页配置（`ttk.Notebook`）：路径配置 / 判定参数 / 定时任务 / 数据库上传 / 运行输出 五个页签，配置相互隔离、互不干扰。
+- **排除已处理日志**（路径配置页勾选，默认勾选）：勾选后内容未变化的已处理日志自动跳过，定时任务不会重复处理旧日志；随「导出/导入配置」JSON 一同保存恢复（字段 `skip_processed`）。
+- **数据库上传**（数据库上传页，见上文「数据库上传（Cloudflare D1）」一节）：勾选「启用数据库上传」并填写账户 ID / 数据库 ID / API Token（掩码显示）后，手动检测与定时检测均会先上传再标记已处理；上传字段随「导出/导入配置」JSON 保存恢复（字段 `upload_enabled / cf_account / cf_database / db_batch`），**API Token 绝不导出，导入时忽略**。
 - **定时任务**（基于 APScheduler，见 `parkcheck/scheduler.py`）：
   - 勾选「启用定时任务」即按配置在后台自动定时检测，取消勾选即停止。
   - 支持两种方式：
@@ -106,9 +136,15 @@ python -m tests.test_check_unopened_gate
 
 # 定时任务模块测试（依赖 apscheduler）
 python -m tests.test_scheduler
+
+# 已处理状态模块测试（无第三方依赖）
+python -m tests.test_state
+
+# 数据库上传模块测试（无第三方依赖，HTTP 层 mock，不依赖真实网络）
+python -m tests.test_db
 ```
 
-两套测试均用断言校验，退出码 0 表示全部通过。
+各套测试均用断言校验，退出码 0 表示全部通过。
 
 ## 约定与注意事项
 
@@ -116,5 +152,6 @@ python -m tests.test_scheduler
 - `document/`、`output/`、`tests/` 均已加入 `.gitignore`。
 - 日志为 `system.<YYYY-MM-DD>.log` 命名，输出 CSV 用同日期命名（`异常车辆_<YYYY-MM-DD>.csv`）。
 - 修改判定逻辑后请补充/调整测试并确保全部通过。
-- 图形界面依赖第三方库：定时任务 `apscheduler`、系统托盘 `pystray`/`Pillow`（安装命令见 `README.md`），核心检测逻辑仍保持无第三方依赖。
+- 图形界面依赖第三方库：定时任务 `apscheduler`、系统托盘 `pystray`/`Pillow`（安装命令见 `README.md`），核心检测逻辑与数据库上传（`db.py`）仍保持无第三方依赖。
+- API Token 等涉密信息不得写入代码、配置文件或「导出配置」JSON。
 - 代码注释、文档一律使用简体中文。
