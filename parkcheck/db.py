@@ -22,6 +22,10 @@ from .output import LOG_DATE_RE
 
 API_BASE = "https://api.cloudflare.com/client/v4"
 REQUEST_TIMEOUT = 30  # 单次请求超时（秒）
+# D1 单次查询最多 100 个绑定参数（超限报 "too many SQL variables"）；
+# 每行占 8 个参数，故单批最多 12 行——用户配置的批量大小超过该值时自动收紧
+D1_MAX_BINDINGS = 100
+PARAMS_PER_ROW = 8
 
 # 建表语句（幂等）：status/remark 由展示项目维护，本工具只写默认值
 CREATE_TABLE_SQL = (
@@ -206,7 +210,10 @@ def upload_records(records, cfg, opener=urllib.request.urlopen, timeout=REQUEST_
     account = str(cfg["cf_account"]).strip()
     database = str(cfg["cf_database"]).strip()
     token = str(cfg["cf_token"]).strip()
+    # 分批大小取「用户配置」与「D1 绑定参数上限」的较小值：
+    # 每行 8 个参数，单批行数不得超过 D1_MAX_BINDINGS // 8 = 12
     batch_size = max(1, int(cfg.get("db_batch") or DB_BATCH_SIZE))
+    batch_size = min(batch_size, D1_MAX_BINDINGS // PARAMS_PER_ROW)
 
     # 每次上传会话先发一次建表请求（幂等）
     d1_query(account, database, token, CREATE_TABLE_SQL, opener=opener, timeout=timeout)

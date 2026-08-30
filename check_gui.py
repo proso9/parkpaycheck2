@@ -61,6 +61,7 @@ from parkcheck.scheduler import (
 from parkcheck.parser import parse_log
 from parkcheck.detector import find_anomalies
 from parkcheck.output import output_results
+from parkcheck.cli import upload_and_mark
 from parkcheck.state import ProcessedState
 
 
@@ -546,9 +547,10 @@ class CheckGui:
         """
         执行检测流程（纯计算，后台线程可调用），返回 (输出文本, 状态)。
 
-        upload_cfg 开启且配置完整时，每个日志文件检测完成后先上传 D1，
-        上传成功才标记已处理；单个文件上传失败不中断整轮，该文件不标记，
-        下轮（含定时触发）会自动重新检测并重试（去重键幂等，不产生重复）。
+        upload_cfg 开启且配置完整时：先扫描完本轮全部日志并输出 CSV，
+        把所有异常记录汇总后统一分批上传；全部成功才统一标记已处理，
+        任一批失败则本轮所有日志均不标记（下轮自动重试，去重键幂等）。
+        关闭上传时行为与无上传版本完全一致（逐文件立即标记）。
         """
         buf = StringIO()
         try:
@@ -563,39 +565,46 @@ class CheckGui:
                     print("提示：已开启数据库上传，但 Cloudflare 账户 ID / 数据库 ID / "
                           "API Token 未配置完整，本次运行不上传。")
                     upload_cfg = dict(upload_cfg, enabled=False)
+                upload_on = bool(upload_cfg and upload_cfg.get("enabled"))
                 # 已处理状态表（存放在输出目录下）：内容未变化的日志不再重复处理
                 state = ProcessedState(
                     os.path.join(out_dir, PROCESSED_STATE_FILE)
                 ) if skip_processed else None
-                processed = skipped = failed = 0
+                processed = skipped = 0
+                pending = []   # [(日志路径, 上传记录列表)]：待统一上传的日志
+                # 第一阶段：逐个扫描全部日志，检出异常并输出 CSV
                 for path in files:
                     if state is not None and state.is_processed(path):
                         skipped += 1
                         print(f"跳过已处理（内容未变化）：{path}")
                         continue
-                    try:
-                        record_a, record_b, record_entry = parse_log(path)
-                        abnormal = find_anomalies(
-                            record_a, record_b, params["window"], record_entry,
-                            entry_dedup_window=params["dedup"],
-                            min_deviation=params["deviation"],
-                        )
-                        output_results(abnormal, path, out_dir)
-                        if upload_cfg and upload_cfg.get("enabled"):
-                            records = build_upload_records(abnormal, path)
-                            inserted = upload_records(records, upload_cfg)
-                            print(f"已上传 {len(records)} 条异常记录到 D1"
-                                  f"（新插入 {inserted} 条）。")
-                    except D1UploadError as exc:
-                        # 上传失败：不标记已处理，继续下一个文件，下轮自动重试
-                        failed += 1
-                        print(f"上传失败（本轮不标记已处理，下轮将自动重试）：{path}\n错误：{exc}")
-                        continue
-                    # 上传成功（或未开启上传）才落盘状态，中途中断也不丢失进度
-                    if state is not None:
-                        state.mark(path)
-                        state.save()
+                    record_a, record_b, record_entry = parse_log(path)
+                    abnormal = find_anomalies(
+                        record_a, record_b, params["window"], record_entry,
+                        entry_dedup_window=params["dedup"],
+                        min_deviation=params["deviation"],
+                    )
+                    output_results(abnormal, path, out_dir)
+                    if upload_on:
+                        pending.append((path, build_upload_records(abnormal, path)))
+                    else:
+                        # 未开启上传：行为与无上传版本一致，逐文件立即标记
+                        if state is not None:
+                            state.mark(path)
+                            state.save()
                     processed += 1
+                # 第二阶段：统一上传——全部成功才统一标记已处理
+                failed = 0
+                if pending:
+                    try:
+                        inserted = upload_and_mark(pending, upload_cfg, state)
+                        total = sum(len(recs) for _, recs in pending)
+                        print(f"已统一上传 {total} 条异常记录到 D1"
+                              f"（新插入 {inserted} 条，涉及 {len(pending)} 个日志）。")
+                    except D1UploadError as exc:
+                        failed = len(pending)
+                        print(f"上传失败（本轮 {failed} 个日志均不标记已处理，"
+                              f"下轮将自动重试）\n错误：{exc}")
                 summary = (f"\n全部处理完成：本次处理 {processed} 个日志，"
                            f"跳过已处理 {skipped} 个。")
                 if failed:

@@ -2,11 +2,12 @@
 """
 命令行入口模块：解析命令行参数、收集日志文件并调度处理流程。
 
-统一编排：parse_log → find_anomalies → output_results →（可选）上传 D1 → 标记已处理。
+统一编排：parse_log → find_anomalies → output_results →（可选）统一上传 D1 → 标记已处理。
 
-上传失败（网络断开、Token 无效、库 ID 错误等）时不标记该日志已处理，
-打印明确错误后继续处理下一个文件；下一轮重新检测时靠 INSERT OR IGNORE
-去重键兜底重试，不产生重复数据。
+上传开启时的语义：先扫描完本轮全部日志并输出 CSV，把所有异常记录汇总后
+统一分批上传；全部成功才统一标记已处理。任一批失败则本轮所有日志均不标记，
+打印明确错误后结束本轮，下一轮重新检测并重试（INSERT OR IGNORE 去重键
+兜底，不产生重复数据）。
 """
 
 import argparse
@@ -122,38 +123,43 @@ def check_upload_cfg(upload_cfg):
     return upload_cfg
 
 
-def process_log_file(path, out_dir, window, upload_cfg=None, state=None,
-                     upload_fn=None):
-    """
-    处理单个日志文件：检测 → 输出 CSV →（可选）上传 D1 → 标记已处理。
-
-    上传开启时：先上传后标记，上传失败抛出 D1UploadError（本函数不捕获），
-    调用方据此保证"上传成功才标记已处理"。upload_fn 仅供测试注入 mock。
-    返回 (异常记录列表, 新插入行数或 None)。
-    """
+def detect_log_file(path, out_dir, window):
+    """检测单个日志文件并输出 CSV，返回异常记录列表（不标记已处理）。"""
     record_a, record_b, record_entry = parse_log(path)
     abnormal = find_anomalies(record_a, record_b, window, record_entry)
     output_results(abnormal, path, out_dir)
+    return abnormal
 
-    inserted = None
-    if upload_cfg and upload_cfg.get("enabled"):
-        records = build_upload_records(abnormal, path)
+
+def upload_and_mark(pending, upload_cfg, state=None, upload_fn=None):
+    """
+    统一上传并标记：把本轮全部日志的异常记录汇总后分批上传，全部成功才统一标记。
+
+    pending 为 [(日志路径, 该日志的上传记录列表), ...]。
+    任一批失败抛出 D1UploadError，调用方保证此时不标记任何日志
+    （下轮重新检测并重试，去重键幂等不产生重复）。upload_fn 仅供测试注入。
+    返回实际新插入行数。
+    """
+    records = [record for _, recs in pending for record in recs]
+    if not records:
+        # 本轮没有检出任何异常记录：无需请求 D1，直接标记已处理
+        inserted = 0
+    else:
         if upload_fn is None:
             upload_fn = upload_records
         inserted = upload_fn(records, upload_cfg)
-        print(f"已上传 {len(records)} 条异常记录到 D1（新插入 {inserted} 条）。")
-
-    # 上传成功（或未开启上传）才标记已处理；上传失败时不走到这里
     if state is not None:
-        state.mark(path)
+        for path, _ in pending:
+            state.mark(path)
         state.save()
-    return abnormal, inserted
+    return inserted
 
 
 def main():
     args = build_parser().parse_args()
 
     upload_cfg = check_upload_cfg(build_upload_cfg(args))
+    upload_on = bool(upload_cfg.get("enabled"))
 
     # 已处理状态表（存放在输出目录下）：内容未变化的日志不再重复处理
     state = None if args.reprocess else ProcessedState(
@@ -161,24 +167,37 @@ def main():
     )
 
     processed = skipped = failed = 0
-    # 逐个处理日志文件
+    pending = []   # [(日志路径, 上传记录列表)]：待统一上传的日志
+    # 第一阶段：逐个扫描全部日志，检出异常并输出 CSV
     for path in collect_log_files(args.log):
         if state is not None and state.is_processed(path):
             skipped += 1
             print(f"跳过已处理（内容未变化）：{path}")
             continue
-        try:
-            process_log_file(path, args.out, args.window,
-                             upload_cfg=upload_cfg, state=state)
-        except D1UploadError as exc:
-            # 上传失败：不标记已处理，下轮自动重试（去重键兜底不产生重复）
-            failed += 1
-            print(f"上传失败（本轮不标记已处理，下轮将自动重试）：{path}\n错误：{exc}")
-            continue
-        # 每处理完一个文件立即落盘，中途中断也不丢失进度
+        abnormal = detect_log_file(path, args.out, args.window)
+        if upload_on:
+            # 上传开启：先汇总，扫描完全部日志后统一上传
+            pending.append((path, build_upload_records(abnormal, path)))
+        else:
+            # 未开启上传：行为与无上传版本一致，逐文件立即标记
+            if state is not None:
+                state.mark(path)
+                state.save()
         processed += 1
 
-    if state is not None:
+    # 第二阶段：统一上传——本轮所有日志的异常记录合并分批上传，
+    # 全部成功才统一标记已处理；任一批失败则全部不标记，下轮重试
+    if pending:
+        try:
+            inserted = upload_and_mark(pending, upload_cfg, state)
+            total = sum(len(recs) for _, recs in pending)
+            print(f"已统一上传 {total} 条异常记录到 D1"
+                  f"（新插入 {inserted} 条，涉及 {len(pending)} 个日志）。")
+        except D1UploadError as exc:
+            failed = len(pending)
+            print(f"上传失败（本轮 {failed} 个日志均不标记已处理，下轮将自动重试）\n错误：{exc}")
+
+    if state is not None or failed:
         summary = f"本次处理 {processed} 个日志，跳过已处理 {skipped} 个。"
         if failed:
             summary += f"上传失败 {failed} 个（未标记已处理，下轮自动重试）。"

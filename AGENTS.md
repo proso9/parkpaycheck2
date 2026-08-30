@@ -70,7 +70,7 @@ parkpaycheck_v2/
 - **仅标准库**：`parkcheck/db.py` 用 `urllib.request` 直接调 D1 REST API（`POST /accounts/{id}/d1/database/{id}/query`），不部署 Worker、不引入第三方依赖；HTTP 层通过 `opener` 参数注入，便于测试 mock。
 - **只插入新记录，永不覆盖**：`INSERT OR IGNORE` + 唯一去重键 `dedup_key = sha256("{log_file}|{exit_time}|{car_number}")`；本工具对已有记录不做任何 UPDATE，`status`/`remark`（0/NULL 默认值之外）由展示项目维护。
 - **表自动创建**：每次上传会话先发一次 `CREATE TABLE IF NOT EXISTS anomalies`（幂等）；日志内 `HH:MM:SS` 时间入库前用文件名日期补全为 `YYYY-MM-DD HH:MM:SS` 全格式；`entry_time`/`fee` 为 `-` 时存 `NULL`。
-- **上传成功才标记已处理**：上传开启时流程为 检测 → 输出 CSV → 上传 D1 → `state.mark()`；上传失败（网络/Token/库 ID 等错误）打印明确错误、不标记该日志、继续处理下一个文件，下一轮自动重试（去重键兜底不产生重复）。关闭上传时行为与无上传版本完全一致。
+- **上传成功才标记已处理（统一上传）**：上传开启时流程为 扫描全部日志 → 输出 CSV → **汇总所有异常记录统一分批上传 D1** → 全部成功才统一标记已处理；任一批失败则本轮所有日志均不标记，打印明确错误后结束本轮，下一轮重新检测并重试（去重键兜底不产生重复）。关闭上传时行为与无上传版本完全一致（逐文件立即标记）。注意 D1 单次查询最多 100 个绑定参数，每行 8 个参数，单批最多 12 行（批量大小配置超过时自动收紧）。
 - **配置**：`config.py` 默认值（`UPLOAD_ENABLED / CF_ACCOUNT_ID / CF_DATABASE_ID / CF_API_TOKEN / DB_BATCH_SIZE`），CLI 参数 `--upload --cf-account --cf-database --cf-token --db-batch` 可覆盖，GUI「数据库上传」页签可编辑。账户 ID / 数据库 ID / Token 任一为空视为未配置上传（等同关闭，提示一次）。
 - **本地密钥持久化（.env）**：`parkcheck/env.py`（仅标准库）在 `config.py` 导入时加载项目根目录 `.env`（可选，缺失静默忽略，已存在的环境变量不被覆盖）。上传 5 项配置优先级：**显式命令行参数 > 环境变量（含 .env）> config.py 默认值**；模板见 `.env.example`，`.env` 已加入 `.gitignore`，不入仓库、不随「导出配置」JSON 导出。
 - **API Token 安全**：Token 绝不随 GUI「导出配置」JSON 导出（见 `check_gui.upload_export_fields`），导入配置时忽略该字段。
