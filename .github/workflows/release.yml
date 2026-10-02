@@ -1,0 +1,72 @@
+name: Nuitka 打包发布
+
+# 推送 v* 形式的 tag 时触发：跑测试 → Nuitka standalone（非 Onefile）打包 GUI → zip 附加到 GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 附加产物到 Release 需要写权限
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows 打包
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ordered-set 为 Nuitka 官方推荐的编译提速依赖，其余为 GUI 运行依赖
+      - name: 安装依赖
+        run: python -m pip install nuitka ordered-set apscheduler pystray Pillow
+
+      # 打包门禁：任一测试失败即终止，不出包
+      - name: 运行测试
+        shell: bash
+        run: |
+          python -m tests.test_check_unopened_gate
+          python -m tests.test_scheduler
+          python -m tests.test_state
+          python -m tests.test_db
+          python -m tests.test_env
+
+      # standalone 模式（非 Onefile）：产物为目录，由后续步骤整体 zip 分发。
+      # pystray / PIL 均存在运行期动态导入后端/插件模块，静态分析可能漏收，显式整包包含。
+      - name: Nuitka standalone 打包 GUI
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"; VERSION="${VERSION%%-*}"
+          python -m nuitka \
+            --standalone \
+            --enable-plugin=tk-inter \
+            --include-package=pystray \
+            --include-package=PIL \
+            --windows-console-mode=disable \
+            --output-dir=build \
+            --output-filename=parkcheck-gui.exe \
+            --product-name=parkcheck \
+            --file-description="停车场异常车辆检测 GUI" \
+            --file-version="$VERSION" \
+            --product-version="$VERSION" \
+            --assume-yes-for-downloads \
+            check_gui.py
+
+      # zip 内保留顶层目录 parkcheck-gui/，解压即用
+      - name: 压缩产物
+        shell: pwsh
+        run: |
+          Rename-Item build/check_gui.dist parkcheck-gui
+          Compress-Archive -Path build/parkcheck-gui -DestinationPath "parkcheck-gui-${{ github.ref_name }}-windows-x64.zip"
+
+      - name: 附加到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: parkcheck-gui-*.zip
+          generate_release_notes: true

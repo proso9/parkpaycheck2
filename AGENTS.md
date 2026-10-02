@@ -15,6 +15,7 @@ parkpaycheck_v2/
 ├── check_unopened_gate.py          # 命令行入口（薄封装，调用 parkcheck.cli）
 ├── check_gui.py                    # 图形界面入口（tkinter 分页 + APScheduler + 系统托盘）
 ├── .env.example                    # 本地密钥配置模板（复制为 .env 使用，.env 不入仓库）
+├── .github/workflows/              # CI：release.yml（tag 触发测试 + Nuitka 打包发布，见「发版打包」一节）
 ├── docs/                           # 需求文档等（如 需求文档_数据库上传.md）
 ├── parkcheck/                      # 检测包
 │   ├── __init__.py                 # 公共 API 聚合导出
@@ -146,12 +147,27 @@ python -m tests.test_db
 
 各套测试均用断言校验，退出码 0 表示全部通过。
 
+## 发版打包（GitHub Actions）
+
+推送 `v*` 格式 tag（如 `v1.2.3`）到远端即自动触发 `.github/workflows/release.yml`：安装 Python 3.12 与依赖 → 运行全部测试（门禁，任一失败即终止，不出包）→ Nuitka `--standalone`（**明确不用 Onefile**）打包 `check_gui.py`（仅 Windows 平台）→ 产物目录压缩为 `parkcheck-gui-<tag>-windows-x64.zip` → 附加到该 tag 对应的 GitHub Release（自动生成发布说明）。
+
+**提交 tag 规范（AI 协作者每次提交 tag 前逐条核对）**：
+
+- 仅在准备发版时提交 tag；tag 一经推送即触发打包与 Release 产出，不要随意删除重打。确需重打必须先删除远端 tag 与对应 Release，再重新推送。
+- tag 命名严格为 `v主.次.修订` 三段数字（如 `v1.2.3`），不带 `-` 后缀：workflow 会把 tag 去掉 `v` 后注入 exe 的文件/产品版本属性，遇到 `-` 会被截断。
+- 提交 tag 前先在本地跑通全部测试；workflow 中测试是打包门禁，失败即不出包。
+- 打包目标只有 `check_gui.py`（GUI）一个入口、仅 Windows 平台；如需新增入口或平台，先修改 workflow 再提 tag。
+- 修改运行依赖（`apscheduler / pystray / Pillow`）、Nuitka 参数或打包流程时，必须同步修改 `.github/workflows/release.yml` 并保持本节描述一致。
+- workflow 内打包参数有讲究，勿凭记忆删改：`--enable-plugin=tk-inter`（tkinter 独立打包必需）；`--include-package=pystray` 与 `--include-package=PIL`（两者均有运行期动态导入，静态分析会漏收子模块，缺失会导致托盘/图标功能崩溃）；`--windows-console-mode=disable`（GUI 不弹控制台）。
+- Nuitka 编译较慢（首次约 10～20 分钟）属正常现象，不是失败；排查构建问题以 Actions 运行日志为准。
+
 ## 约定与注意事项
 
 - 输出结果写入 `output/`，**不要**写入 `document/`。
 - `document/`、`output/`、`tests/` 均已加入 `.gitignore`。
 - **日志选取**：扫描目录时只分析符合 `system.<YYYY-MM-DD>.log` 命名的文件；`platform.*` 等其他前缀、无日期日志（如 `system.log`、`platform.log`）一律排除，不进入分析逻辑（规则在 `parkcheck/config.py` 的 `is_analyzed_log_name`，CLI 与 GUI 共用）；显式指定的单个日志文件不做命名过滤。输出 CSV 用同日期命名（`异常车辆_<YYYY-MM-DD>.csv`）。
 - 修改判定逻辑后请补充/调整测试并确保全部通过。
+- **发版打 tag**：推送 `v*` tag 即触发自动打包发布，提交前逐条核对「发版打包（GitHub Actions）」一节的规范。
 - 图形界面依赖第三方库：定时任务 `apscheduler`、系统托盘 `pystray`/`Pillow`（安装命令见 `README.md`），核心检测逻辑与数据库上传（`db.py`）仍保持无第三方依赖。
 - API Token 等涉密信息不得写入代码、配置文件或「导出配置」JSON。
 - 代码注释、文档一律使用简体中文。
