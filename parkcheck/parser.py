@@ -50,6 +50,10 @@ DIR_OUT_RE = re.compile(r"方向[:：]\s*出口")
 # 提取停车时间，形如：停车时间:4天,剩余:1418分钟 → (天, 分钟)
 PARK_TIME_RE = re.compile(r"停车时间[:：]\s*(\d+)\s*天[，,]\s*剩余[:：]?\s*(\d+)\s*分钟")
 
+# 逐行快速预筛：一行必须至少含下列关键词之一才可能产生记录或影响状态，
+# 其余行（调试、HTTP 等噪音行）一次扫描即跳过，免去后续多次子串与正则匹配
+KEY_LINE_RE = re.compile("出场处理|支付结果下发|方向|入场车牌号|用户需支付费用|停车时间")
+
 
 def time_to_seconds(t_str):
     """将 'HH:MM:SS' 转换为当天秒数；格式不合法时返回 None。"""
@@ -57,7 +61,7 @@ def time_to_seconds(t_str):
     if len(parts) != 3:
         return None
     try:
-        h, m, s = (int(p) for p in parts)
+        h, m, s = map(int, parts)
     except ValueError:
         return None
     if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
@@ -67,13 +71,13 @@ def time_to_seconds(t_str):
 
 def normalize_car(car):
     """
-    车牌归一化：去首尾及内部空白、统一转为大写。
+    车牌归一化：去所有空白字符、统一转为大写。
     保证记录A《…》中的车牌与记录B carNumber 字段在匹配时严格对应，
     避免因空格/大小写差异导致匹配错乱（乱套）。
     """
     if not car:
         return None
-    normalized = re.sub(r"\s+", "", str(car)).upper()
+    normalized = "".join(str(car).split()).upper()
     return normalized or None
 
 
@@ -161,21 +165,12 @@ def parse_log(file_path):
     last_park_seconds = None     # 最近一条"停车时间"行的时刻(秒)
     last_park_minutes = None     # 最近一条"停车时间"总分钟数
 
-    def reset_fee(sec):
-        """费用行出现时更新最近费用与时刻。"""
-        nonlocal last_fee, last_fee_seconds
-        last_fee, last_fee_seconds = None, None
-        if sec is not None:
-            fee = extract_fee(content)
-            if fee is not None:
-                last_fee, last_fee_seconds = fee, sec
-
     def reset_burst_state():
         """新的"方向：出口"扫描开始一次出场流程：重置待关联的费用/停车时间。
 
         费用/停车时间行紧跟在本车出口扫描之后出现（支付流程还会在出场
         处理之后重算一次费用），若不重置，上一辆车（甚至几小时前）的
-        费用/停车时间会串到本次无费用行的出场上，导致金额取错并被误判。
+        费用/停车时间会串到本次出场上，导致金额取错并被误判。
         """
         nonlocal last_fee, last_fee_seconds, last_park_minutes, last_park_seconds
         last_fee, last_fee_seconds = None, None
@@ -197,10 +192,15 @@ def parse_log(file_path):
                 # 不带时间戳：业务延续行，使用最近时刻作为当前时刻
                 content = line
 
+            # 快速预筛：不含任何业务关键词的行直接跳过（时间状态已更新，
+            # 供后续延续行继承）
+            if not KEY_LINE_RE.search(content):
+                continue
+
             # 新的"方向：出口"相机扫描：开始一次新的出场流程（爆点），
             # 重置待关联的费用/停车时间。本次的费用/停车时间行紧跟其后出现；
             # 不重置会把上一辆车的费用/停车时间串到本次出场上
-            if DIR_OUT_RE.search(content):
+            if "方向" in content and DIR_OUT_RE.search(content):
                 reset_burst_state()
 
             # 记录A：出场处理 且 不开闸
@@ -239,7 +239,7 @@ def parse_log(file_path):
             # 入场事件：相机"方向：入口"扫描（含重复上传），或"入场车牌号"行兜底。
             # 同一辆车被多机位重复扫到也会在此被重复记录，
             # 由 detector 按 ENTRY_DEDUP_WINDOW 归并并取第一次。
-            if DIR_IN_RE.search(content):
+            if "方向" in content and DIR_IN_RE.search(content):
                 car = normalize_car(extract_cam_plate(content))
                 if car and current_seconds is not None:
                     record_entry.append({
@@ -257,8 +257,10 @@ def parse_log(file_path):
                     })
 
             # 用户需支付费用行：更新本爆点内最近费用（放在记录A之后判断，费用行本身非记录A/B）
-            if KEY_FEE in content:
-                reset_fee(current_seconds)
+            if KEY_FEE in content and current_seconds is not None:
+                fee = extract_fee(content)
+                if fee is not None:
+                    last_fee, last_fee_seconds = fee, current_seconds
 
             # 停车时间行：更新本爆点内最近停车时间（紧跟在出口相机扫描后出现）
             if KEY_PARK_TIME in content:
