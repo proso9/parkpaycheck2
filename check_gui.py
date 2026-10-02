@@ -65,6 +65,21 @@ from parkcheck.config import is_analyzed_log_name
 from parkcheck.state import ProcessedState
 
 
+def _set_app_user_model_id():
+    """Windows：为进程声明独立的 AppUserModelID。
+
+    不设置时任务栏按 python.exe 归组，任务栏与通知弹窗都显示 Python 默认图标；
+    设置后 Windows 以本应用身份展示窗口图标。必须在创建任何窗口之前调用。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("parkcheck.gui")
+    except Exception:
+        pass
+
+
 def collect_log_files(path):
     """
     收集待处理日志目录下符合"system.<YYYY-MM-DD>.log"命名的文件。
@@ -733,28 +748,51 @@ class CheckGui:
             pass
 
     # ---------------- 应用图标（托盘 + 主窗口共用） ----------------
-    def _make_icon_image(self):
-        """生成蓝底白 P 的图标图片（PIL Image，供托盘与主窗口复用）。"""
+    def _make_icon_image(self, size=64):
+        """生成蓝底白 P 的图标图片（PIL Image，供托盘与主窗口复用）。
+
+        边距与字号按 64px 基准等比缩放，可用更大尺寸渲染出更清晰的多尺寸 ico。
+        """
         from PIL import Image, ImageFont, ImageDraw
-        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         # 蓝色正方形底（四周留 1px 透明边，避免贴边不清晰）
-        draw.rectangle((1, 1, 62, 62), fill="#2f6fed")
+        margin = max(1, round(size / 64))
+        draw.rectangle((margin, margin, size - margin - 1, size - margin - 1), fill="#2f6fed")
         # 优先使用系统字体放大 P，失败则退回默认字体（默认字体不支持中文，故用 ASCII）
         try:
-            font = ImageFont.truetype("arial.ttf", 55)
+            font = ImageFont.truetype("arial.ttf", round(size * 55 / 64))
         except (OSError, Exception):
             font = ImageFont.load_default()
         # 把文本水平垂直居中
         text = "P"
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        pos = ((64 - tw) / 2 - bbox[0], (64 - th) / 2 - bbox[1])
+        pos = ((size - tw) / 2 - bbox[0], (size - th) / 2 - bbox[1])
         draw.text(pos, text, fill="white", font=font)
         return img
 
+    def _write_icon_file(self):
+        """把应用图标渲染为多尺寸 .ico 文件（写入系统临时目录，返回路径）。
+
+        以 256px 渲染、由 PIL 缩放出各尺寸，任务栏 16/32px 下比 64px 直接绘制更清晰；
+        iconphoto 生成的图标在部分 Windows 系统上不被任务栏采用，iconbitmap 才可靠。
+        """
+        import tempfile
+        img = self._make_icon_image(256)
+        path = os.path.join(tempfile.gettempdir(), "parkcheck_app.ico")
+        img.save(
+            path, format="ICO",
+            sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)],
+        )
+        return path
+
     def _set_window_icon(self):
-        """为主窗口设置应用图标（与托盘一致的蓝底白 P）。"""
+        """为主窗口设置应用图标（与托盘一致的蓝底白 P）。
+
+        iconphoto 一并设置，保证后续 Toplevel（如说明窗口）默认继承同一图标；
+        Windows 下再以多尺寸 .ico 执行 iconbitmap，任务栏才能显示应用图标而非 Python 图标。
+        """
         try:
             from PIL import ImageTk
         except ImportError:
@@ -763,6 +801,11 @@ class CheckGui:
         # 保留引用，避免被垃圾回收导致图标消失
         self._window_icon = icon_img
         self.root.iconphoto(True, icon_img)
+        if sys.platform == "win32":
+            try:
+                self.root.iconbitmap(self._write_icon_file())
+            except Exception:
+                pass
 
     # ---------------- 系统托盘 ----------------
     def _setup_tray(self):
@@ -771,12 +814,31 @@ class CheckGui:
             import pystray
         except ImportError:
             return
+
+        class _TrayIcon(pystray.Icon):
+            def _notify(self, message, title=None):
+                # pystray 的 Windows 通知只发文本（NIF_INFO 未带 dwInfoFlags/hBalloonIcon），
+                # 通知弹窗因此显示系统默认图标；这里补上托盘图标句柄。
+                try:
+                    from pystray._util import win32
+                    self._assert_icon_handle()
+                    self._message(
+                        win32.NIM_MODIFY,
+                        win32.NIF_INFO,
+                        szInfo=message,
+                        szInfoTitle=title or self.title or "",
+                        dwInfoFlags=0x00000004 | 0x00000020,  # NIIF_USER | NIIF_LARGE_ICON
+                        hBalloonIcon=self._icon_handle,
+                    )
+                except Exception:
+                    super()._notify(message, title)
+
         img = self._make_icon_image()
         menu = pystray.Menu(
             pystray.MenuItem("显示主窗口", self._tray_show),
             pystray.MenuItem("退出程序", self._tray_quit),
         )
-        self._tray_icon = pystray.Icon("parkcheck", img, "停车场异常车辆检测", menu)
+        self._tray_icon = _TrayIcon("parkcheck", img, "停车场异常车辆检测", menu)
         threading.Thread(target=self._tray_icon.run, daemon=True).start()
         self._tray_available = True
 
@@ -830,6 +892,7 @@ class CheckGui:
 
 
 def main():
+    _set_app_user_model_id()   # 任务栏与通知按本应用身份显示图标，而非 python.exe
     root = tk.Tk()
     CheckGui(root)
     root.mainloop()
