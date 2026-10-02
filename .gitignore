@@ -54,3 +54,5 @@ config/*.local.yaml
 # 开发文档
 document/
 docs/
+# ZCode 工具自动生成的排除规则（内容派生自本文件，可随时再生成）
+.zcodeignore
