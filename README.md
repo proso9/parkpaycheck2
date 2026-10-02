@@ -20,6 +20,7 @@
 - **核心检测**（无第三方依赖）：解析系统日志，定位「出场不开闸」且窗口期无同车支付下发的车辆，并反查入场时间、关联用户需支付费用。
 - **可疑标记**：对比系统「停车时间」与「入场→出场」实际时长，明显超出的车辆（如门卫遥控放行）额外标记为可疑。
 - **排除已处理日志**：内容未变化的已处理日志自动跳过，定时任务不会重复处理旧日志；当天仍在写入的日志会正常重新检测。
+- **单文件失败隔离**：任一日志解析/输出失败只跳过该文件，不中断本轮，其余日志照常处理；失败文件下一轮自动重试（命令行与图形界面行为一致）。
 - **数据库上传（Cloudflare D1）**：异常记录自动上传到 D1（仅标准库实现，直接调 D1 REST API）；`INSERT OR IGNORE` + 去重键幂等，只插入新记录、永不覆盖；上传成功才标记日志已处理，失败自动留待下轮重试。
 - **图形界面（GUI）**：基于 tkinter，五个配置页签（路径配置 / 判定参数 / 定时任务 / 数据库上传 / 运行输出），配置可导入导出 JSON（API Token 绝不导出）。
 - **定时任务**：基于 APScheduler，间隔运行或每天固定时间，修改配置无需重启即生效。
@@ -70,6 +71,9 @@ python check_unopened_gate.py document\system.2026-08-22.log
 # 调整判定窗口(秒)与输出目录
 python check_unopened_gate.py -w 300 -o output
 
+# 细调可疑标记阈值(分钟)与入场去重窗口(秒)
+python check_unopened_gate.py --min-deviation 5 --entry-dedup 5
+
 # 忽略已处理记录，强制重新处理所有日志
 python check_unopened_gate.py --reprocess
 
@@ -84,6 +88,8 @@ python -m parkcheck.cli -w 300 -o output
 | ---- | ---- | ------ |
 | `log`（位置参数） | 日志文件或目录 | `document` |
 | `-w, --window` | 判定窗口秒数 | `300` |
+| `--min-deviation` | 最小停车时间偏差（分钟），超出才算可疑 | `5` |
+| `--entry-dedup` | 入场去重窗口（秒），同车相邻入口扫描归并为一次入场 | `5` |
 | `-o, --out` | CSV 导出目录 | `output` |
 | `--reprocess` | 忽略已处理记录，强制重跑 | 关闭 |
 | `--upload` | 启用数据库上传 | 关闭 |
@@ -158,7 +164,7 @@ DB_BATCH_SIZE=50
 
 ### CSV 结果
 
-写入 `output/`，命名 `异常车辆_<日志日期>.csv`（如处理 `system.2026-08-22.log` 生成 `异常车辆_2026-08-22.csv`）：
+写入 `output/`，命名 `异常车辆_<日志日期>.csv`（如处理 `system.2026-08-22.log` 生成 `异常车辆_2026-08-22.csv`）。文件以 `UTF-8-SIG`（带 BOM）编码写入，Excel 双击打开不乱码：
 
 | 列 | 说明 |
 | -- | ---- |
@@ -226,8 +232,9 @@ parkpaycheck_v2/
 
 ## 注意事项
 
-- 输出结果写入 `output/`，**不要**写入 `document/`；两者与 `tests/` 均已加入 `.gitignore`。
+- 输出结果写入 `output/`，**不要**写入 `document/`；两者均已加入 `.gitignore`。
 - 日志为 `system.<YYYY-MM-DD>.log` 命名，输出 CSV 用同日期命名。
-- **日志选取**：扫描目录时只分析符合 `system.<YYYY-MM-DD>.log` 命名的文件；`platform.*` 等其他前缀、无日期日志（如 `system.log`、`platform.log`）一律排除，不进入分析逻辑（规则见 `parkcheck/config.py` 的 `is_analyzed_log_name`，CLI 与 GUI 共用）；显式指定的单个日志文件不做命名过滤。
+- **日志选取**：扫描目录时只分析符合 `system.<YYYY-MM-DD>.log` 命名的文件；`platform.*` 等其他前缀、无日期日志（如 `system.log`、`platform.log`）一律排除，不进入分析逻辑（规则见 `parkcheck/config.py` 的 `is_analyzed_log_name`，CLI 与 GUI 共用，大小写不敏感）；显式指定的单个日志文件不做命名过滤。
+- **单文件失败隔离**：任一日志处理失败只跳过该文件并打印错误，不中断本轮；失败文件不标记已处理，下一轮（含定时触发）自动重试。
 - **API Token 等涉密信息不得写入代码、配置文件或「导出配置」JSON**；本地持久化用 `.env`（不入仓库）。
-- 修改判定逻辑后请运行本地测试（`tests/` 目录，不入仓库）并确保全部通过。
+- 修改判定逻辑后请运行本地测试（`python -m tests.test_check_unopened_gate` 等，见仓库 `tests/` 目录）并确保全部通过。

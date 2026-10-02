@@ -14,9 +14,10 @@ parkpaycheck_v2/
 ├── README.md                       # 项目介绍、使用说明与依赖安装命令
 ├── check_unopened_gate.py          # 命令行入口（薄封装，调用 parkcheck.cli）
 ├── check_gui.py                    # 图形界面入口（tkinter 分页 + APScheduler + 系统托盘）
+├── start_gui.vbs                   # GUI 静默启动脚本（pythonw 无黑窗口，可放开机自启）
 ├── .env.example                    # 本地密钥配置模板（复制为 .env 使用，.env 不入仓库）
 ├── .github/workflows/              # CI：release.yml（tag 触发测试 + Nuitka 打包发布，见「发版打包」一节）
-├── docs/                           # 需求文档等（如 需求文档_数据库上传.md）
+├── docs/                           # 需求文档等（如 需求文档_数据库上传.md，已纳入版本管理）
 ├── parkcheck/                      # 检测包
 │   ├── __init__.py                 # 公共 API 聚合导出
 │   ├── config.py                   # 常量与默认参数（上传配置支持环境变量/.env 覆盖）
@@ -27,8 +28,8 @@ parkpaycheck_v2/
 │   ├── db.py                       # 数据库上传（Cloudflare D1 REST API，仅标准库）
 │   ├── state.py                    # 已处理文件状态（跳过未变化的已处理日志）
 │   ├── scheduler.py                # 定时任务（APScheduler 封装）
-│   └── cli.py                      # 命令行入口
-├── tests/
+│   └── cli.py                      # 命令行入口与检测编排（run_detection_round，GUI 复用）
+├── tests/                          # 测试（已纳入版本管理，发版工作流的测试门禁依赖）
 │   ├── test_check_unopened_gate.py # 核心逻辑无依赖断言式测试
 │   ├── test_scheduler.py           # 定时任务模块测试（依赖 apscheduler）
 │   ├── test_state.py               # 已处理状态模块测试（无依赖）
@@ -50,7 +51,7 @@ parkpaycheck_v2/
 4. **入场反查**（`detector.find_anomalies`）：以相机`方向：入口`扫描（含重复上传）作为入场事件来源，`入场车牌号`行兜底；同一辆车 5 秒内的重复入口扫描归并为同一次入场并取第一次，本次出场取之前最近一次入场事件的时间；无匹配入场用 `-` 标记（窗口 `ENTRY_DEDUP_WINDOW` 可调）。
 5. **可疑标记**（`detector.compute_anomaly`）：解析出场相机扫描后的"停车时间:X天,剩余:Y分钟"，换算成总分钟数；与"入场→出场"实际时长比较，仅当系统停车时间**明显**大于实际时长（至少多出 `MIN_PARK_TIME_DEVIATION` 分钟，如被门卫遥控放行）时在输出中标记"异常"为 1，否则为 0。
 
-各模块职责：`config.py` 存放关键词与参数默认值，`parser.py` 负责时间/车牌/费用/入场提取与拆行，`detector.py` 负责异常判定与入场反查，`output.py` 负责控制台与 CSV 输出，`db.py` 负责 Cloudflare D1 上传（REST API 客户端、建表、去重键、批量插入），`state.py` 负责已处理日志文件的状态记录与排除。
+各模块职责：`config.py` 存放关键词与参数默认值，`parser.py` 负责时间/车牌/费用/入场提取与拆行，`detector.py` 负责异常判定与入场反查，`output.py` 负责控制台与 CSV 输出，`db.py` 负责 Cloudflare D1 上传（REST API 客户端、建表、去重键、批量插入），`state.py` 负责已处理日志文件的状态记录与排除，`cli.py` 负责命令行入口与**一轮检测的统一编排**（`run_detection_round`：逐文件 解析→判定→输出→按开关决定标记时机，CLI 与 GUI 共用同一函数，两条入口行为保证一致）。
 
 关键实现点：
 
@@ -88,6 +89,9 @@ python check_unopened_gate.py document\system.2026-08-22.log
 # 调整判定窗口(秒)与输出目录
 python check_unopened_gate.py -w 300 -o output
 
+# 细调可疑标记阈值(分钟)与入场去重窗口(秒)
+python check_unopened_gate.py --min-deviation 5 --entry-dedup 5
+
 # 忽略已处理记录，强制重新处理所有日志
 python check_unopened_gate.py --reprocess
 
@@ -100,7 +104,9 @@ python -m parkcheck.cli -w 300 -o output
 
 参数均在 `parkcheck/config.py` 定义默认值，并在 `parkcheck/cli.py` 的 argparse 中提供覆盖，未硬编码。
 
-**已处理日志排除**（`parkcheck/state.py`，CLI 与 GUI 默认启用）：已处理日志的状态（大小 + 修改时间）记录在输出目录下的 `.processed.json`，内容未变化的日志自动跳过；仍在追加写入的日志（如当天日志）不受影响，会正常重新检测。`--reprocess` 可忽略记录强制重跑；换输出目录即重新记录，互不干扰。
+**已处理日志排除**（`parkcheck/state.py`，CLI 与 GUI 默认启用）：已处理日志的状态（大小 + 修改时间）记录在输出目录下的 `.processed.json`，内容未变化的日志自动跳过；仍在追加写入的日志（如当天日志）不受影响，会正常重新检测。`--reprocess` 可忽略记录强制重跑；换输出目录即重新记录，互不干扰。状态键按平台规则归一大小写（Windows 下同一文件不同大小写写法视为同一记录）。
+
+**单文件失败隔离**（CLI 与 GUI 共用 `run_detection_round`，行为一致）：任一日志解析/输出失败只跳过该文件并打印错误，**不中断本轮**，其余日志照常处理；失败文件不标记已处理（上传模式下也不进入汇总），下一轮自动重试。
 
 ## 图形界面与定时任务
 
@@ -144,6 +150,9 @@ python -m tests.test_state
 
 # 数据库上传模块测试（无第三方依赖，HTTP 层 mock，不依赖真实网络）
 python -m tests.test_db
+
+# .env 读取模块测试（无第三方依赖）
+python -m tests.test_env
 ```
 
 各套测试均用断言校验，退出码 0 表示全部通过。
@@ -165,8 +174,8 @@ python -m tests.test_db
 ## 约定与注意事项
 
 - 输出结果写入 `output/`，**不要**写入 `document/`。
-- `document/`、`output/`、`tests/` 均已加入 `.gitignore`。
-- **日志选取**：扫描目录时只分析符合 `system.<YYYY-MM-DD>.log` 命名的文件；`platform.*` 等其他前缀、无日期日志（如 `system.log`、`platform.log`）一律排除，不进入分析逻辑（规则在 `parkcheck/config.py` 的 `is_analyzed_log_name`，CLI 与 GUI 共用）；显式指定的单个日志文件不做命名过滤。输出 CSV 用同日期命名（`异常车辆_<YYYY-MM-DD>.csv`）。
+- `document/`、`output/` 已加入 `.gitignore`；`tests/`、`docs/` **纳入版本管理**（发版工作流的测试门禁在 CI 检出仓库后运行，缺文件会直接失败）。
+- **日志选取**：扫描目录时只分析符合 `system.<YYYY-MM-DD>.log` 命名的文件；`platform.*` 等其他前缀、无日期日志（如 `system.log`、`platform.log`）一律排除，不进入分析逻辑（规则在 `parkcheck/config.py` 的 `is_analyzed_log_name`，CLI 与 GUI 共用，大小写不敏感——`.LOG` 大写扩展名同样收集）；显式指定的单个日志文件不做命名过滤。输出 CSV 用同日期命名（`异常车辆_<YYYY-MM-DD>.csv`）。
 - 修改判定逻辑后请补充/调整测试并确保全部通过。
 - **发版打 tag**：推送 `v*` tag 即触发自动打包发布，提交前逐条核对「发版打包（GitHub Actions）」一节的规范。
 - 图形界面依赖第三方库：定时任务 `apscheduler`、系统托盘 `pystray`/`Pillow`（安装命令见 `README.md`），核心检测逻辑与数据库上传（`db.py`）仍保持无第三方依赖。
