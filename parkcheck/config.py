@@ -11,6 +11,7 @@
 """
 
 import os
+import re
 
 from .env import load_project_env
 
@@ -55,6 +56,18 @@ ENTRY_DEDUP_WINDOW = 5              # 重复"方向：入口"扫描归并为同�
 ENTRY_MARK_MISSING = "-"            # 未找到入场时间时的标记
 DEFAULT_OUT_DIR = "output"          # 默认输出目录（不放入 document，且已加入 .gitignore）
 PROCESSED_STATE_FILE = ".processed.json"  # 已处理日志状态文件名（存放在输出目录下）
+
+# ---------------- 日志选取 ----------------
+# 目录扫描时仅"system.<YYYY-MM-DD>.log"进入分析；其余一律排除，不进入分析逻辑：
+#   - 其他前缀的带日期日志（如 platform.2026-09-05.log）
+#   - 不带日期的日志（如 system.log、platform.log）
+# 大小写不敏感（Windows 文件系统本身不区分大小写）。
+LOG_NAME_RE = re.compile(r"^system\.\d{4}-\d{2}-\d{2}\.log$", re.IGNORECASE)
+
+
+def is_analyzed_log_name(name):
+    """判断文件名是否符合"system.<YYYY-MM-DD>.log"命名，符合才进入分析逻辑。"""
+    return bool(LOG_NAME_RE.match(name))
 
 # ---------------- 数据库上传（Cloudflare D1） ----------------
 # 仅上传异常记录：INSERT OR IGNORE + 唯一去重键，只插入新记录，永不覆盖。

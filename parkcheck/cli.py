@@ -23,6 +23,7 @@ from .config import (
     CF_DATABASE_ID,
     CF_API_TOKEN,
     DB_BATCH_SIZE,
+    is_analyzed_log_name,
 )
 from .db import (
     D1UploadError,
@@ -43,7 +44,8 @@ def build_parser():
     )
     parser.add_argument(
         "log", nargs="?", default="document",
-        help="日志文件路径，或包含日志的目录（默认指定目录内所有 .log 文件）"
+        help="日志文件路径，或包含日志的目录（默认指定目录，仅分析其中"
+             "符合 system.<YYYY-MM-DD>.log 命名的文件，platform.* 及无日期日志不处理）"
     )
     parser.add_argument(
         "-w", "--window", type=int, default=WINDOW_SECONDS,
@@ -83,14 +85,20 @@ def build_parser():
 
 
 def collect_log_files(path):
-    """收集待处理的日志文件列表：目录则取其中所有 .log，文件则单列，否则报错退出。"""
+    """
+    收集待处理的日志文件列表。
+
+    目录则只取其中符合"system.<YYYY-MM-DD>.log"命名的文件（platform.* 等
+    其他前缀、不带日期的日志一律排除，不进入分析逻辑）；文件则单列
+    （显式指定的单个文件不做命名过滤，由使用者自行决定）；否则报错退出。
+    """
     log_files = []
     if os.path.isdir(path):
         for name in sorted(os.listdir(path)):
-            if name.endswith(".log"):
+            if name.endswith(".log") and is_analyzed_log_name(name):
                 log_files.append(os.path.join(path, name))
         if not log_files:
-            print(f"目录 {path} 下未找到 .log 文件")
+            print(f"目录 {path} 下未找到符合 system.<YYYY-MM-DD>.log 命名的日志文件")
             sys.exit(1)
     elif os.path.isfile(path):
         log_files = [path]

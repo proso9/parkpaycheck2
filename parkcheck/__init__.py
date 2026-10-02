@@ -19,6 +19,7 @@ from .config import (
     ENTRY_MARK_MISSING,
     DEFAULT_OUT_DIR,
     PROCESSED_STATE_FILE,
+    is_analyzed_log_name,
 )
 from .parser import parse_log
 from .detector import find_anomalies
@@ -32,13 +33,14 @@ from .db import (
 )
 from .state import ProcessedState
 from .scheduler import SchedulerManager
-from .cli import main
+from .cli import main, collect_log_files
 
 __all__ = [
     "WINDOW_SECONDS",
     "ENTRY_MARK_MISSING",
     "DEFAULT_OUT_DIR",
     "PROCESSED_STATE_FILE",
+    "is_analyzed_log_name",
     "parse_log",
     "find_anomalies",
     "output_results",
@@ -50,4 +52,5 @@ __all__ = [
     "ProcessedState",
     "SchedulerManager",
     "main",
+    "collect_log_files",
 ]

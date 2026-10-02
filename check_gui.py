@@ -61,18 +61,25 @@ from parkcheck.parser import parse_log
 from parkcheck.detector import find_anomalies
 from parkcheck.output import output_results
 from parkcheck.cli import upload_and_mark
+from parkcheck.config import is_analyzed_log_name
 from parkcheck.state import ProcessedState
 
 
 def collect_log_files(path):
-    """收集待处理日志目录下所有 .log 文件。path 必须为目录。返回 (日志列表, 错误信息)。"""
+    """
+    收集待处理日志目录下符合"system.<YYYY-MM-DD>.log"命名的文件。
+    path 必须为目录。返回 (日志列表, 错误信息)。
+    platform.* 等其他前缀、不带日期的日志一律排除，不进入分析逻辑。
+    """
     if not os.path.isdir(path):
         return [], f"路径不是目录或不存在：{path}"
     files = sorted(
-        os.path.join(path, n) for n in os.listdir(path) if n.endswith(".log")
+        os.path.join(path, n)
+        for n in os.listdir(path)
+        if n.endswith(".log") and is_analyzed_log_name(n)
     )
     if not files:
-        return [], f"目录 {path} 下未找到 .log 文件"
+        return [], f"目录 {path} 下未找到符合 system.<YYYY-MM-DD>.log 命名的日志文件"
     return files, None
 
 
@@ -336,7 +343,9 @@ class CheckGui:
    入场并取第一次时间，避免重复计次或把出场重试误判为新停车周期。
 
 4. 日志目录
-   待处理日志所属目录（使用绝对路径），将处理其中所有 .log 文件。
+   待处理日志所属目录（使用绝对路径），仅分析其中符合
+   system.<YYYY-MM-DD>.log 命名的文件；platform.* 等其他前缀、
+   不带日期的日志（如 system.log、platform.log）不进入分析。
 
 5. 输出目录
    CSV 结果导出目录（使用绝对路径），不存在时自动创建。

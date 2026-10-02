@@ -47,7 +47,7 @@ python -m pip install apscheduler pystray Pillow
 ### 30 秒上手
 
 ```powershell
-# 处理 document/ 下所有日志，结果输出到 output/
+# 处理 document/ 下所有 system.<日期>.log（platform.* 及无日期日志不分析），结果输出到 output/
 python check_unopened_gate.py
 
 # 或启动图形界面
@@ -61,7 +61,7 @@ python check_gui.py
 ### 命令行
 
 ```powershell
-# 处理 document/ 下所有日志，默认输出到 output/
+# 处理 document/ 下所有 system.<日期>.log（platform.* 及无日期日志不分析），默认输出到 output/
 python check_unopened_gate.py
 
 # 指定单个日志
@@ -225,5 +225,6 @@ parkpaycheck_v2/
 
 - 输出结果写入 `output/`，**不要**写入 `document/`；两者与 `tests/` 均已加入 `.gitignore`。
 - 日志为 `system.<YYYY-MM-DD>.log` 命名，输出 CSV 用同日期命名。
+- **日志选取**：扫描目录时只分析符合 `system.<YYYY-MM-DD>.log` 命名的文件；`platform.*` 等其他前缀、无日期日志（如 `system.log`、`platform.log`）一律排除，不进入分析逻辑（规则见 `parkcheck/config.py` 的 `is_analyzed_log_name`，CLI 与 GUI 共用）；显式指定的单个日志文件不做命名过滤。
 - **API Token 等涉密信息不得写入代码、配置文件或「导出配置」JSON**；本地持久化用 `.env`（不入仓库）。
 - 修改判定逻辑后请运行本地测试（`tests/` 目录，不入仓库）并确保全部通过。
