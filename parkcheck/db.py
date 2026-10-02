@@ -163,7 +163,7 @@ def d1_query(account_id, database_id, token, sql, params=None,
     })
     try:
         with opener(request, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read()
     except urllib.error.HTTPError as exc:
         # 尝试读取响应体中的错误详情，辅助定位问题
         detail = ""
@@ -182,6 +182,15 @@ def d1_query(account_id, database_id, token, sql, params=None,
         raise D1UploadError(f"网络错误，无法连接 Cloudflare API：{exc.reason}") from exc
     except OSError as exc:
         raise D1UploadError(f"网络错误，无法连接 Cloudflare API：{exc}") from exc
+
+    # 响应体必须是 JSON：代理/网关拦截页、HTML 错误页等一律转成可读的上传错误
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise D1UploadError(
+            f"D1 API 响应不是有效 JSON，可能被代理/网关拦截或服务异常："
+            f"{raw[:200]!r}"
+        ) from exc
 
     if not isinstance(payload, dict) or payload.get("success") is not True:
         errors = payload.get("errors") if isinstance(payload, dict) else payload

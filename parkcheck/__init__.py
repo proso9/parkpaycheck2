@@ -33,7 +33,7 @@ from .db import (
 )
 from .state import ProcessedState
 from .scheduler import SchedulerManager
-from .cli import main, collect_log_files
+from .cli import main, collect_log_files, list_log_files, run_detection_round
 
 __all__ = [
     "WINDOW_SECONDS",
@@ -53,4 +53,6 @@ __all__ = [
     "SchedulerManager",
     "main",
     "collect_log_files",
+    "list_log_files",
+    "run_detection_round",
 ]

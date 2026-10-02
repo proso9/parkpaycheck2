@@ -46,30 +46,22 @@ from parkcheck.config import (
     MIN_PARK_TIME_DEVIATION,
     ENTRY_DEDUP_WINDOW,
     DEFAULT_OUT_DIR,
-    PROCESSED_STATE_FILE,
     DB_BATCH_SIZE,
     UPLOAD_ENABLED,
     CF_ACCOUNT_ID,
     CF_DATABASE_ID,
     CF_API_TOKEN,
 )
-from parkcheck.db import (
-    D1UploadError,
-    build_upload_records,
-    upload_records,
-    is_upload_configured,
-)
 from parkcheck.scheduler import (
     SchedulerManager,
     interval_to_seconds,
     validate_daily_time,
 )
-from parkcheck.parser import parse_log
-from parkcheck.detector import find_anomalies
-from parkcheck.output import output_results
-from parkcheck.cli import upload_and_mark
-from parkcheck.config import is_analyzed_log_name
-from parkcheck.state import ProcessedState
+from parkcheck.cli import (
+    check_upload_cfg,
+    list_log_files,
+    run_detection_round,
+)
 
 
 # ---------------- 主题配色（浅色，主色与托盘图标一致） ----------------
@@ -312,24 +304,6 @@ class _ToolTip:
         if self._tip is not None:
             self._tip.destroy()
             self._tip = None
-
-
-def collect_log_files(path):
-    """
-    收集待处理日志目录下符合"system.<YYYY-MM-DD>.log"命名的文件。
-    path 必须为目录。返回 (日志列表, 错误信息)。
-    platform.* 等其他前缀、不带日期的日志一律排除，不进入分析逻辑。
-    """
-    if not os.path.isdir(path):
-        return [], f"路径不是目录或不存在：{path}"
-    files = sorted(
-        os.path.join(path, n)
-        for n in os.listdir(path)
-        if n.endswith(".log") and is_analyzed_log_name(n)
-    )
-    if not files:
-        return [], f"目录 {path} 下未找到符合 system.<YYYY-MM-DD>.log 命名的日志文件"
-    return files, None
 
 
 def upload_export_fields(enabled, account, database, batch):
@@ -990,73 +964,40 @@ class CheckGui:
         """
         执行检测流程（纯计算，后台线程可调用），返回 (输出文本, 状态)。
 
-        upload_cfg 开启且配置完整时：先扫描完本轮全部日志并输出 CSV，
-        把所有异常记录汇总后统一分批上传；全部成功才统一标记已处理，
-        任一批失败则本轮所有日志均不标记（下轮自动重试，去重键幂等）。
-        关闭上传时行为与无上传版本完全一致（逐文件立即标记）。
+        与命令行共用 cli.run_detection_round 一轮检测编排：
+        先扫描完本轮全部日志并输出 CSV；开启上传时把所有异常记录汇总后
+        统一分批上传，全部成功才统一标记已处理，任一批失败则本轮所有
+        日志均不标记（下轮自动重试，去重键幂等）；关闭上传时逐文件立即标记。
+        单个日志失败只跳过该文件，不中断本轮。
         """
         buf = StringIO()
         try:
             with redirect_stdout(buf):
-                files, err = collect_log_files(log_path)
+                files, err = list_log_files(log_path)
                 if err:
                     print(err)
                     return buf.getvalue(), "失败"
                 # 开关开启但凭证不全：视为未配置上传（等同关闭），只提示一次
-                if upload_cfg and upload_cfg.get("enabled") \
-                        and not is_upload_configured(upload_cfg):
-                    print("提示：已开启数据库上传，但 Cloudflare 账户 ID / 数据库 ID / "
-                          "API Token 未配置完整，本次运行不上传。")
-                    upload_cfg = dict(upload_cfg, enabled=False)
-                upload_on = bool(upload_cfg and upload_cfg.get("enabled"))
-                # 已处理状态表（存放在输出目录下）：内容未变化的日志不再重复处理
-                state = ProcessedState(
-                    os.path.join(out_dir, PROCESSED_STATE_FILE)
-                ) if skip_processed else None
-                processed = skipped = 0
-                pending = []   # [(日志路径, 上传记录列表)]：待统一上传的日志
-                # 第一阶段：逐个扫描全部日志，检出异常并输出 CSV
-                for path in files:
-                    if state is not None and state.is_processed(path):
-                        skipped += 1
-                        print(f"跳过已处理（内容未变化）：{path}")
-                        continue
-                    record_a, record_b, record_entry = parse_log(path)
-                    abnormal = find_anomalies(
-                        record_a, record_b, params["window"], record_entry,
-                        entry_dedup_window=params["dedup"],
-                        min_deviation=params["deviation"],
-                    )
-                    output_results(abnormal, path, out_dir)
-                    if upload_on:
-                        pending.append((path, build_upload_records(abnormal, path)))
-                    else:
-                        # 未开启上传：行为与无上传版本一致，逐文件立即标记
-                        if state is not None:
-                            state.mark(path)
-                            state.save()
-                    processed += 1
-                # 第二阶段：统一上传——全部成功才统一标记已处理
-                failed = 0
-                if pending:
-                    try:
-                        inserted = upload_and_mark(pending, upload_cfg, state)
-                        total = sum(len(recs) for _, recs in pending)
-                        print(f"已统一上传 {total} 条异常记录到 D1"
-                              f"（新插入 {inserted} 条，涉及 {len(pending)} 个日志）。")
-                    except D1UploadError as exc:
-                        failed = len(pending)
-                        print(f"上传失败（本轮 {failed} 个日志均不标记已处理，"
-                              f"下轮将自动重试）\n错误：{exc}")
+                upload_cfg = check_upload_cfg(upload_cfg or {})
+                processed, skipped, errors, failed = run_detection_round(
+                    files, out_dir, params["window"],
+                    entry_dedup_window=params["dedup"],
+                    min_deviation=params["deviation"],
+                    skip_processed=skip_processed,
+                    upload_cfg=upload_cfg,
+                )
                 summary = (f"\n全部处理完成：本次处理 {processed} 个日志，"
                            f"跳过已处理 {skipped} 个。")
+                if errors:
+                    summary += f"读取失败 {errors} 个（未标记已处理，下轮自动重试）。"
                 if failed:
                     summary += f"上传失败 {failed} 个（未标记已处理，下轮自动重试）。"
                 print(summary)
         except Exception as exc:  # 界面层兜底，避免后台线程静默崩溃
             buf.write(f"\n发生错误：{exc}\n")
             return buf.getvalue(), "出错"
-        return buf.getvalue(), "完成"
+        status = "完成" if not errors and not failed else "完成（有失败项）"
+        return buf.getvalue(), status
 
     def _finish(self, text, status):
         """把输出写到文本框，并恢复按钮状态（须在主线程调用）。"""

@@ -3,6 +3,8 @@
 命令行入口模块：解析命令行参数、收集日志文件并调度处理流程。
 
 统一编排：parse_log → find_anomalies → output_results →（可选）统一上传 D1 → 标记已处理。
+完整一轮检测封装在 run_detection_round，GUI（check_gui.py）复用同一函数，
+保证两条入口的编排行为（输出、标记时机、错误隔离）完全一致。
 
 上传开启时的语义：先扫描完本轮全部日志并输出 CSV，把所有异常记录汇总后
 统一分批上传；全部成功才统一标记已处理。任一批失败则本轮所有日志均不标记，
@@ -23,6 +25,8 @@ from .config import (
     CF_DATABASE_ID,
     CF_API_TOKEN,
     DB_BATCH_SIZE,
+    ENTRY_DEDUP_WINDOW,
+    MIN_PARK_TIME_DEVIATION,
     is_analyzed_log_name,
 )
 from .db import (
@@ -50,6 +54,16 @@ def build_parser():
     parser.add_argument(
         "-w", "--window", type=int, default=WINDOW_SECONDS,
         help=f"判定窗口秒数，默认 {WINDOW_SECONDS}"
+    )
+    parser.add_argument(
+        "--min-deviation", type=int, default=MIN_PARK_TIME_DEVIATION,
+        help=f"最小停车时间偏差(分钟)：系统停车时间比实际时长至少多出该分钟数才"
+             f"标记可疑，默认 {MIN_PARK_TIME_DEVIATION}"
+    )
+    parser.add_argument(
+        "--entry-dedup", type=int, default=ENTRY_DEDUP_WINDOW,
+        help=f"入场去重窗口(秒)：同车相邻入口扫描间隔不超过该秒数归并为同一次入场，"
+             f"默认 {ENTRY_DEDUP_WINDOW}"
     )
     parser.add_argument(
         "-o", "--out", default=DEFAULT_OUT_DIR,
@@ -84,26 +98,33 @@ def build_parser():
     return parser
 
 
-def collect_log_files(path):
+def list_log_files(path):
     """
-    收集待处理的日志文件列表。
+    收集待处理的日志文件列表，返回 (文件列表, 错误信息)。
 
     目录则只取其中符合"system.<YYYY-MM-DD>.log"命名的文件（platform.* 等
     其他前缀、不带日期的日志一律排除，不进入分析逻辑）；文件则单列
-    （显式指定的单个文件不做命名过滤，由使用者自行决定）；否则报错退出。
+    （显式指定的单个文件不做命名过滤，由使用者自行决定）；否则返回错误信息。
     """
-    log_files = []
     if os.path.isdir(path):
-        for name in sorted(os.listdir(path)):
-            if name.endswith(".log") and is_analyzed_log_name(name):
-                log_files.append(os.path.join(path, name))
+        log_files = [
+            os.path.join(path, name)
+            for name in sorted(os.listdir(path))
+            if is_analyzed_log_name(name)
+        ]
         if not log_files:
-            print(f"目录 {path} 下未找到符合 system.<YYYY-MM-DD>.log 命名的日志文件")
-            sys.exit(1)
-    elif os.path.isfile(path):
-        log_files = [path]
-    else:
-        print(f"路径不存在：{path}")
+            return [], f"目录 {path} 下未找到符合 system.<YYYY-MM-DD>.log 命名的日志文件"
+        return log_files, None
+    if os.path.isfile(path):
+        return [path], None
+    return [], f"路径不存在：{path}"
+
+
+def collect_log_files(path):
+    """命令行入口的日志收集：收集失败打印错误并退出（错误信息见 list_log_files）。"""
+    log_files, err = list_log_files(path)
+    if err:
+        print(err)
         sys.exit(1)
     return log_files
 
@@ -139,6 +160,68 @@ def detect_log_file(path, out_dir, window):
     return abnormal
 
 
+def run_detection_round(files, out_dir, window,
+                        entry_dedup_window=ENTRY_DEDUP_WINDOW,
+                        min_deviation=MIN_PARK_TIME_DEVIATION,
+                        skip_processed=True, upload_cfg=None):
+    """
+    执行一轮完整检测（CLI 与 GUI 共用），返回 (processed, skipped, errors, failed)。
+
+    - 逐文件 解析 → 判定 → 输出 CSV；单个文件失败只跳过该文件并打印错误，
+      不中断本轮（该文件不标记已处理，下轮自动重试）；
+    - 上传开启：汇总所有异常记录统一分批上传，全部成功才统一标记已处理；
+      任一批失败本轮全部不标记（failed = 待上传日志数）；
+    - 上传关闭：逐文件立即标记已处理（skip_processed=False 时不标记）。
+    """
+    upload_on = bool(upload_cfg and upload_cfg.get("enabled"))
+    state = ProcessedState(
+        os.path.join(out_dir, PROCESSED_STATE_FILE)
+    ) if skip_processed else None
+
+    processed = skipped = errors = 0
+    pending = []   # [(日志路径, 上传记录列表)]：待统一上传的日志
+    # 第一阶段：逐个扫描全部日志，检出异常并输出 CSV
+    for path in files:
+        if state is not None and state.is_processed(path):
+            skipped += 1
+            print(f"跳过已处理（内容未变化）：{path}")
+            continue
+        try:
+            record_a, record_b, record_entry = parse_log(path)
+            abnormal = find_anomalies(
+                record_a, record_b, window, record_entry,
+                entry_dedup_window=entry_dedup_window,
+                min_deviation=min_deviation,
+            )
+            output_results(abnormal, path, out_dir)
+            if upload_on:
+                # 上传开启：先汇总，扫描完全部日志后统一上传
+                pending.append((path, build_upload_records(abnormal, path)))
+            elif state is not None:
+                # 未开启上传：行为与无上传版本一致，逐文件立即标记
+                state.mark(path)
+                state.save()
+        except Exception as exc:
+            errors += 1
+            print(f"处理失败（跳过该日志，不标记已处理，下轮自动重试）：{path}\n错误：{exc}")
+            continue
+        processed += 1
+
+    # 第二阶段：统一上传——本轮所有日志的异常记录合并分批上传，
+    # 全部成功才统一标记已处理；任一批失败则全部不标记，下轮重试
+    failed = 0
+    if pending:
+        try:
+            inserted = upload_and_mark(pending, upload_cfg, state)
+            total = sum(len(recs) for _, recs in pending)
+            print(f"已统一上传 {total} 条异常记录到 D1"
+                  f"（新插入 {inserted} 条，涉及 {len(pending)} 个日志）。")
+        except D1UploadError as exc:
+            failed = len(pending)
+            print(f"上传失败（本轮 {failed} 个日志均不标记已处理，下轮将自动重试）\n错误：{exc}")
+    return processed, skipped, errors, failed
+
+
 def upload_and_mark(pending, upload_cfg, state=None, upload_fn=None):
     """
     统一上传并标记：把本轮全部日志的异常记录汇总后分批上传，全部成功才统一标记。
@@ -158,7 +241,10 @@ def upload_and_mark(pending, upload_cfg, state=None, upload_fn=None):
         inserted = upload_fn(records, upload_cfg)
     if state is not None:
         for path, _ in pending:
-            state.mark(path)
+            try:
+                state.mark(path)
+            except OSError:
+                pass  # 日志文件已消失（如被移动/删除），无需记录
         state.save()
     return inserted
 
@@ -167,49 +253,21 @@ def main():
     args = build_parser().parse_args()
 
     upload_cfg = check_upload_cfg(build_upload_cfg(args))
-    upload_on = bool(upload_cfg.get("enabled"))
 
-    # 已处理状态表（存放在输出目录下）：内容未变化的日志不再重复处理
-    state = None if args.reprocess else ProcessedState(
-        os.path.join(args.out, PROCESSED_STATE_FILE)
+    files = collect_log_files(args.log)
+    processed, skipped, errors, failed = run_detection_round(
+        files, args.out, args.window,
+        entry_dedup_window=args.entry_dedup,
+        min_deviation=args.min_deviation,
+        skip_processed=not args.reprocess,
+        upload_cfg=upload_cfg,
     )
-
-    processed = skipped = failed = 0
-    pending = []   # [(日志路径, 上传记录列表)]：待统一上传的日志
-    # 第一阶段：逐个扫描全部日志，检出异常并输出 CSV
-    for path in collect_log_files(args.log):
-        if state is not None and state.is_processed(path):
-            skipped += 1
-            print(f"跳过已处理（内容未变化）：{path}")
-            continue
-        abnormal = detect_log_file(path, args.out, args.window)
-        if upload_on:
-            # 上传开启：先汇总，扫描完全部日志后统一上传
-            pending.append((path, build_upload_records(abnormal, path)))
-        else:
-            # 未开启上传：行为与无上传版本一致，逐文件立即标记
-            if state is not None:
-                state.mark(path)
-                state.save()
-        processed += 1
-
-    # 第二阶段：统一上传——本轮所有日志的异常记录合并分批上传，
-    # 全部成功才统一标记已处理；任一批失败则全部不标记，下轮重试
-    if pending:
-        try:
-            inserted = upload_and_mark(pending, upload_cfg, state)
-            total = sum(len(recs) for _, recs in pending)
-            print(f"已统一上传 {total} 条异常记录到 D1"
-                  f"（新插入 {inserted} 条，涉及 {len(pending)} 个日志）。")
-        except D1UploadError as exc:
-            failed = len(pending)
-            print(f"上传失败（本轮 {failed} 个日志均不标记已处理，下轮将自动重试）\n错误：{exc}")
-
-    if state is not None or failed:
-        summary = f"本次处理 {processed} 个日志，跳过已处理 {skipped} 个。"
-        if failed:
-            summary += f"上传失败 {failed} 个（未标记已处理，下轮自动重试）。"
-        print(summary)
+    summary = f"本次处理 {processed} 个日志，跳过已处理 {skipped} 个。"
+    if errors:
+        summary += f"读取失败 {errors} 个（未标记已处理，下轮自动重试）。"
+    if failed:
+        summary += f"上传失败 {failed} 个（未标记已处理，下轮自动重试）。"
+    print(summary)
 
 
 if __name__ == "__main__":

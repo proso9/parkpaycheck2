@@ -13,12 +13,18 @@ import json
 import os
 
 
+def _state_key(path):
+    """状态表键：绝对路径并按平台规则归一大小写（Windows 不区分路径大小写，
+    同一文件的不同大小写写法必须视为同一条记录，否则会重复处理）。"""
+    return os.path.normcase(os.path.abspath(path))
+
+
 class ProcessedState:
-    """已处理日志文件状态表：按「绝对路径 → (大小, 修改时间)」记录。"""
+    """已处理日志文件状态表：按「归一化绝对路径 → (大小, 修改时间)」记录。"""
 
     def __init__(self, state_path):
         self._path = state_path
-        self._records = {}   # {绝对路径: {"size": 字节数, "mtime": 修改时间戳}}
+        self._records = {}   # {归一化绝对路径: {"size": 字节数, "mtime": 修改时间戳}}
         self._load()
 
     @property
@@ -41,7 +47,7 @@ class ProcessedState:
 
     def is_processed(self, path):
         """文件是否已处理且此后内容未发生变化。"""
-        record = self._records.get(os.path.abspath(path))
+        record = self._records.get(_state_key(path))
         if record is None:
             return False
         try:
@@ -53,7 +59,7 @@ class ProcessedState:
     def mark(self, path):
         """把文件记为已处理（记录当前大小与修改时间）。"""
         stat = os.stat(path)
-        self._records[os.path.abspath(path)] = {
+        self._records[_state_key(path)] = {
             "size": stat.st_size,
             "mtime": stat.st_mtime,
         }
