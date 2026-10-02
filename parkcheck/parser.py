@@ -10,6 +10,13 @@
   每行形如  HH:MM:SS - 日志内容
   部分业务行（如"出场处理…"）不带时间戳前缀，属于上一条带时间戳行的延续，
   因此解析时需要用"最近一条带时间戳行的时间"作为其时间。
+
+费用/停车时间的归属（爆点关联）：
+  一次出场流程（爆点）以"方向：出口"相机扫描行开始，费用("用户需支付费用")
+  与系统"停车时间"行紧跟在本车出口扫描之后出现；支付流程还会在出场处理之后
+  重算一次费用（同关键词再次出现）。因此解析到新的出口扫描行即重置待关联的
+  费用/停车时间，出场处理只关联本次出口扫描之后的最近一条，
+  避免上一辆车（可能早在几小时前）的费用/停车时间串到本次出场上。
 """
 
 import json
@@ -38,6 +45,8 @@ ENTRY_RE = re.compile(r"入场车牌号[:：]\s*([^，,]+)")
 CAM_PLATE_RE = re.compile(r"车牌号[:：]\s*([^，,]+)")
 # 相机扫描方向，形如：方向：入口 / 方向：出口（含"重复上传"等前缀行）
 DIR_IN_RE = re.compile(r"方向[:：]\s*入口")
+# 出口相机扫描行：一次出场流程（爆点）的起点，费用/停车时间行紧跟其后出现
+DIR_OUT_RE = re.compile(r"方向[:：]\s*出口")
 # 提取停车时间，形如：停车时间:4天,剩余:1418分钟 → (天, 分钟)
 PARK_TIME_RE = re.compile(r"停车时间[:：]\s*(\d+)\s*天[，,]\s*剩余[:：]?\s*(\d+)\s*分钟")
 
@@ -135,8 +144,9 @@ def parse_log(file_path):
                   park_minutes:int|None}]
                 出场不开闸记录（fee 为该车本次出场"用户需支付费用"，
                 park_minutes 为该车本次出场的系统"停车时间"总分钟数。
-                费用/停车时间与出场相机识别同时出现，故按日志顺序直接
-                取最近一条（仅要求其时刻不晚于本出场），不再设关联窗口）
+                费用/停车时间行紧跟本次"方向：出口"扫描之后出现，解析到
+                新的出口扫描行即重置待关联状态，故仅关联本次出口扫描
+                之后的最近一条，防止上一辆车的费用/停车时间串到本次）
       record_b: [{time:'HH:MM:SS', seconds:int, car:str}]  支付结果下发记录
       record_entry: [{time:'HH:MM:SS', seconds:int, car:str}]
                 入场记录（用于反查异常车辆入场时间）
@@ -160,6 +170,17 @@ def parse_log(file_path):
             if fee is not None:
                 last_fee, last_fee_seconds = fee, sec
 
+    def reset_burst_state():
+        """新的"方向：出口"扫描开始一次出场流程：重置待关联的费用/停车时间。
+
+        费用/停车时间行紧跟在本车出口扫描之后出现（支付流程还会在出场
+        处理之后重算一次费用），若不重置，上一辆车（甚至几小时前）的
+        费用/停车时间会串到本次无费用行的出场上，导致金额取错并被误判。
+        """
+        nonlocal last_fee, last_fee_seconds, last_park_minutes, last_park_seconds
+        last_fee, last_fee_seconds = None, None
+        last_park_minutes, last_park_seconds = None, None
+
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for raw in f:
             line = raw.rstrip("\r\n")
@@ -176,12 +197,19 @@ def parse_log(file_path):
                 # 不带时间戳：业务延续行，使用最近时刻作为当前时刻
                 content = line
 
+            # 新的"方向：出口"相机扫描：开始一次新的出场流程（爆点），
+            # 重置待关联的费用/停车时间。本次的费用/停车时间行紧跟其后出现；
+            # 不重置会把上一辆车的费用/停车时间串到本次出场上
+            if DIR_OUT_RE.search(content):
+                reset_burst_state()
+
             # 记录A：出场处理 且 不开闸
             if KEY_OUT_PROCESS in content and KEY_NO_GATE in content:
                 car = normalize_car(extract_plate(content))
                 if car and current_seconds is not None:
-                    # 费用/停车时间行与出场相机识别同时出现，直接按日志顺序取最近一条；
-                    # 仅要求其时刻不晚于本次出场（当前秒数 >= 该行秒数），不再设关联窗口
+                    # 费用/停车时间取本次出口扫描之后（当前爆点内）、不晚于本次
+                    # 出场的最近一条；出口扫描时已重置，current_seconds >= 该行秒数
+                    # 仅作时间回拨（如日志内校时）时的兜底
                     fee = None
                     if (last_fee is not None and last_fee_seconds is not None
                             and current_seconds >= last_fee_seconds):
@@ -228,11 +256,11 @@ def parse_log(file_path):
                         "car": car,
                     })
 
-            # 用户需支付费用行：更新最近费用（放在记录A之后判断，费用行本身非记录A/B）
+            # 用户需支付费用行：更新本爆点内最近费用（放在记录A之后判断，费用行本身非记录A/B）
             if KEY_FEE in content:
                 reset_fee(current_seconds)
 
-            # 停车时间行：更新最近停车时间（该行为出场相机扫描后的业务行）
+            # 停车时间行：更新本爆点内最近停车时间（紧跟在出口相机扫描后出现）
             if KEY_PARK_TIME in content:
                 pm = extract_park_minutes(content)
                 if pm is not None and current_seconds is not None:
