@@ -33,6 +33,14 @@ import csv
 # 将项目根目录加入 sys.path，以便导入被测试包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认编码可能是 cp1252/gbk，统一改为 UTF-8 输出，
+# 避免 print 中文（Windows 版 GitHub Actions 运行器同样受影响）时抛 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # 标准流被替换或不支持重配置时忽略
+        pass
+
 import parkcheck as cug  # noqa: E402
 from parkcheck.cli import build_parser, run_detection_round  # noqa: E402
 

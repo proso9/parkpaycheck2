@@ -21,6 +21,11 @@ jobs:
   build:
     name: Windows 打包
     runs-on: windows-latest
+    # Windows 运行器默认控制台编码为 cp1252/gbk，Python 打印中文会抛 UnicodeEncodeError，
+    # 这里统一指定 UTF-8（测试脚本内部也会兜底重配置标准流）
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: 1
     steps:
       - name: 检出代码
         uses: actions/checkout@v4

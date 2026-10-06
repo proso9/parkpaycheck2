@@ -10,6 +10,13 @@ import shutil
 # 将项目根目录加入 sys.path，以便导入被测试包
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 控制台默认编码可能是 cp1252/gbk，统一改为 UTF-8 输出，避免 print 中文报错
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from parkcheck.state import ProcessedState  # noqa: E402
 
 

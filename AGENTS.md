@@ -157,6 +157,8 @@ python -m tests.test_env
 
 各套测试均用断言校验，退出码 0 表示全部通过。
 
+测试脚本会在启动时把 `sys.stdout` / `sys.stderr` 重配置为 UTF-8；Windows 运行器（`windows-latest`）默认控制台编码为 cp1252，直接打印中文会抛 `UnicodeEncodeError`，新增测试文件时应保留这段兜底（或在 CI 中设置 `PYTHONIOENCODING=utf-8`，workflow 已配置）。
+
 ## 发版打包（GitHub Actions）
 
 推送 `v*` 格式 tag（如 `v1.2.3`）到远端即自动触发 `.github/workflows/release.yml`：安装 Python 3.12 与依赖 → 运行全部测试（门禁，任一失败即终止，不出包）→ Nuitka `--standalone`（**明确不用 Onefile**）打包 `check_gui.py`（仅 Windows 平台）→ 产物目录压缩为 `parkcheck-gui-<tag>-windows-x64.zip` → 附加到该 tag 对应的 GitHub Release（自动生成发布说明）。
