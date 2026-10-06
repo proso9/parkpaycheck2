@@ -5,6 +5,13 @@ on:
   push:
     tags:
       - 'v*'
+  # 也可在 Actions 页面手动触发，需填写 version
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动触发版本号，如 1.0.0 或 1.0.0-beta，无需 v 前缀'
+        required: true
+        type: string
 
 # 附加产物到 Release 需要写权限
 permissions:
@@ -22,6 +29,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      # 统一解析版本：push tag 用 tag 名，手动触发用输入值
+      - name: 解析版本
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW_VERSION="${INPUT_VERSION}"
+          else
+            RAW_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          RAW_VERSION="${RAW_VERSION#v}"
+          FILE_VERSION="${RAW_VERSION%%-*}"
+          TAG_NAME="v${RAW_VERSION}"
+
+          echo "RAW_VERSION=$RAW_VERSION" >> "$GITHUB_ENV"
+          echo "FILE_VERSION=$FILE_VERSION" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
 
       # ordered-set 为 Nuitka 官方推荐的编译提速依赖，其余为 GUI 运行依赖
       - name: 安装依赖
@@ -42,7 +70,6 @@ jobs:
       - name: Nuitka standalone 打包 GUI
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"; VERSION="${VERSION%%-*}"
           python -m nuitka \
             --standalone \
             --enable-plugin=tk-inter \
@@ -53,8 +80,8 @@ jobs:
             --output-filename=parkcheck-gui.exe \
             --product-name=parkcheck \
             --file-description="停车场异常车辆检测 GUI" \
-            --file-version="$VERSION" \
-            --product-version="$VERSION" \
+            --file-version="$FILE_VERSION" \
+            --product-version="$FILE_VERSION" \
             --assume-yes-for-downloads \
             check_gui.py
 
@@ -63,10 +90,12 @@ jobs:
         shell: pwsh
         run: |
           Rename-Item build/check_gui.dist parkcheck-gui
-          Compress-Archive -Path build/parkcheck-gui -DestinationPath "parkcheck-gui-${{ github.ref_name }}-windows-x64.zip"
+          Compress-Archive -Path build/parkcheck-gui -DestinationPath "parkcheck-gui-${{ env.TAG_NAME }}-windows-x64.zip"
 
+      # 手动触发时显式指定 tag_name，确保 Release 能正确创建/更新
       - name: 附加到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG_NAME }}
           files: parkcheck-gui-*.zip
           generate_release_notes: true
