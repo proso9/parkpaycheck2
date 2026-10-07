@@ -16,7 +16,9 @@ parkpaycheck_v2/
 ├── check_gui.py                    # 图形界面入口（tkinter 分页 + APScheduler + 系统托盘）
 ├── start_gui.vbs                   # GUI 静默启动脚本（pythonw 无黑窗口，可放开机自启）
 ├── .env.example                    # 本地密钥配置模板（复制为 .env 使用，.env 不入仓库）
-├── .github/workflows/              # CI：release.yml（tag 触发测试 + Nuitka 打包发布，见「发版打包」一节）
+├── .github/workflows/              # CI：release.yml（创建 Release 触发测试 + 打包安装程序发布，见「发版打包」一节）
+├── installer/
+│   └── parkcheck.iss               # Inno Setup 安装包脚本（CI 打单个安装 exe 用，必须保存为 UTF-8 带 BOM）
 ├── docs/                           # 需求文档等（如 需求文档_数据库上传.md，已纳入版本管理）
 ├── parkcheck/                      # 检测包
 │   ├── __init__.py                 # 公共 API 聚合导出
@@ -161,17 +163,20 @@ python -m tests.test_env
 
 ## 发版打包（GitHub Actions）
 
-推送 `v*` 格式 tag（如 `v1.2.3`）到远端即自动触发 `.github/workflows/release.yml`：安装 Python 3.12 与依赖 → 运行全部测试（门禁，任一失败即终止，不出包）→ Nuitka `--standalone`（**明确不用 Onefile**）打包 `check_gui.py`（仅 Windows 平台）→ 产物目录压缩为 `parkcheck-gui-<tag>-windows-x64.zip` → 附加到该 tag 对应的 GitHub Release（自动生成发布说明）。
+在 GitHub 上创建并发布 Release（tag 命名 `v主.次.修订`，可让 GitHub 在建 Release 时顺带创建 tag）即自动触发 `.github/workflows/release.yml`：安装 Python 3.12 与依赖 → 运行全部测试（门禁，任一失败即终止，不出包）→ Nuitka `--standalone`（**明确不用 Onefile**）打包 `check_gui.py`（仅 Windows 平台）→ Inno Setup 把 standalone 产物打成**单个安装程序** `parkcheck-setup-<tag>-windows-x64.exe` → 附加到该 Release（发布说明在建 Release 时编写，workflow 不再自动追加）。也可在 Actions 页面手动触发补构建（填版本号，可选指定分支/tag）。安装器为用户级安装：默认装到 `%LOCALAPPDATA%\parkcheck`，无需管理员权限（GUI 默认日志/输出目录在安装目录下，必须保证当前用户可写），可选创建桌面快捷方式，自带卸载器。
 
-**提交 tag 规范（AI 协作者每次提交 tag 前逐条核对）**：
+**发版规范（AI 协作者每次发版前逐条核对）**：
 
-- 仅在准备发版时提交 tag；tag 一经推送即触发打包与 Release 产出，不要随意删除重打。确需重打必须先删除远端 tag 与对应 Release，再重新推送。
-- tag 命名严格为 `v主.次.修订` 三段数字（如 `v1.2.3`），不带 `-` 后缀：workflow 会把 tag 去掉 `v` 后注入 exe 的文件/产品版本属性，遇到 `-` 会被截断。
-- 提交 tag 前先在本地跑通全部测试；workflow 中测试是打包门禁，失败即不出包。
-- 打包目标只有 `check_gui.py`（GUI）一个入口、仅 Windows 平台；如需新增入口或平台，先修改 workflow 再提 tag。
-- 修改运行依赖（`apscheduler / pystray / Pillow`）、Nuitka 参数或打包流程时，必须同步修改 `.github/workflows/release.yml` 并保持本节描述一致。
+- 发版前先在本地跑通全部测试；workflow 中测试是打包门禁，失败即不出包——注意 Release 已随创建而公开存在，测试/打包失败会留下一个暂无产物的 Release，此时优先去 Actions 页面重跑该次 workflow 补传产物。
+- tag/Release 命名严格为 `v主.次.修订` 三段数字（如 `v1.2.3`），不带 `-` 后缀：workflow 会把 tag 去掉 `v` 后注入 exe 的文件/产品版本属性，遇到 `-` 会被截断。
+- 确需重新发版必须先删除远端 Release 与对应 tag，再重新创建；不要随意删除重打。
+- 打包目标只有 `check_gui.py`（GUI）一个入口、仅 Windows 平台；如需新增入口或平台，先修改 workflow 与 `installer/parkcheck.iss` 再发版。
+- 修改运行依赖（`apscheduler / pystray / Pillow`）、Nuitka 参数、安装脚本或打包流程时，必须同步修改 `.github/workflows/release.yml`（及 `installer/parkcheck.iss`）并保持本节描述一致。
 - workflow 内打包参数有讲究，勿凭记忆删改：`--enable-plugin=tk-inter`（tkinter 独立打包必需）；`--include-package=pystray` 与 `--include-package=PIL`（两者均有运行期动态导入，静态分析会漏收子模块，缺失会导致托盘/图标功能崩溃）；`--windows-console-mode=disable`（GUI 不弹控制台）。
+- 触发只监听 `release: published`，**不监听 `push: tags`**：创建 Release 同时新建 tag 会同时触发两种事件，双重监听会导致一次发版跑两遍构建。
+- `installer/parkcheck.iss` 必须保存为 UTF-8（带 BOM），否则中文 AppName 会按 ANSI 解析而乱码；Inno Setup 由 CI 用 `choco install innosetup` 安装。
 - Nuitka 编译较慢（首次约 10～20 分钟）属正常现象，不是失败；排查构建问题以 Actions 运行日志为准。
+- 从 Release 下载的安装程序未做代码签名，浏览器下载与 SmartScreen 会提示"未知发布者"，属预期现象。
 
 ## 约定与注意事项
 
@@ -179,7 +184,7 @@ python -m tests.test_env
 - `document/`、`output/` 已加入 `.gitignore`；`tests/`、`docs/` **纳入版本管理**（发版工作流的测试门禁在 CI 检出仓库后运行，缺文件会直接失败）。
 - **日志选取**：扫描目录时只分析符合 `system.<YYYY-MM-DD>.log` 命名的文件；`platform.*` 等其他前缀、无日期日志（如 `system.log`、`platform.log`）一律排除，不进入分析逻辑（规则在 `parkcheck/config.py` 的 `is_analyzed_log_name`，CLI 与 GUI 共用，大小写不敏感——`.LOG` 大写扩展名同样收集）；显式指定的单个日志文件不做命名过滤。输出 CSV 用同日期命名（`异常车辆_<YYYY-MM-DD>.csv`）。
 - 修改判定逻辑后请补充/调整测试并确保全部通过。
-- **发版打 tag**：推送 `v*` tag 即触发自动打包发布，提交前逐条核对「发版打包（GitHub Actions）」一节的规范。
+- **发版发布**：在 GitHub 上创建并发布 Release（tag 命名 `v主.次.修订`）即触发自动打包，发版前逐条核对「发版打包（GitHub Actions）」一节的规范。
 - 图形界面依赖第三方库：定时任务 `apscheduler`、系统托盘 `pystray`/`Pillow`（安装命令见 `README.md`），核心检测逻辑与数据库上传（`db.py`）仍保持无第三方依赖。
 - API Token 等涉密信息不得写入代码、配置文件或「导出配置」JSON。
 - 代码注释、文档一律使用简体中文。

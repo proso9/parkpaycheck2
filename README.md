@@ -29,7 +29,15 @@
 
 ## 快速开始
 
-### 环境要求与安装
+### 方式一：下载安装包（推荐，免 Python 环境）
+
+到 [Releases](../../releases) 页面下载 `parkcheck-setup-v<版本>-windows-x64.exe`，双击安装：默认装到当前用户的 `%LOCALAPPDATA%\parkcheck`（不需要管理员权限），可选创建桌面快捷方式，从开始菜单或安装目录运行 `parkcheck-gui.exe`。
+
+- 安装程序未做代码签名，浏览器下载与 SmartScreen 提示「未知发布者」时选择「仍要运行 / 保留」即可。
+- 升级：下载新版安装包直接覆盖安装（若程序正在运行会提示先关闭）；卸载走系统「应用与功能」。
+- GUI 默认日志/输出目录位于安装目录下的 `document/`、`output/`（初始均不存在，请先在「路径配置」页选择实际的日志目录）。
+
+### 方式二：从源码运行
 
 - Windows 10 / 11，Python 3.8+
 
@@ -198,6 +206,8 @@ parkpaycheck_v2/
 ├── check_gui.py                    # 图形界面入口（tkinter 分页 + APScheduler + 系统托盘）
 ├── start_gui.vbs                   # GUI 静默启动脚本（pythonw 无黑窗口，可放开机自启）
 ├── .env.example                    # 本地密钥配置模板（复制为 .env 使用，.env 不入仓库）
+├── installer/
+│   └── parkcheck.iss               # Inno Setup 安装包脚本（CI 打单个安装 exe 用）
 ├── docs/                           # 需求文档等（如 需求文档_数据库上传.md）
 ├── parkcheck/                      # 检测包
 │   ├── __init__.py                 # 公共 API 聚合导出

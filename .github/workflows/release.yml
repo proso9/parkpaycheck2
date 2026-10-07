@@ -1,16 +1,21 @@
 name: Nuitka 打包发布
 
-# 推送 v* 形式的 tag 时触发：跑测试 → Nuitka standalone（非 Onefile）打包 GUI → zip 附加到 GitHub Release
+# 创建并发布 Release（tag 命名 v*）时触发：跑测试 → Nuitka standalone（非 Onefile）打包 GUI
+# → Inno Setup 打成单个安装程序 → 附加到该 Release。也可在 Actions 页面手动触发补构建。
+# 注意：不再监听 push: tags——创建 Release 同时新建 tag 会同时触发两种事件，双重监听会导致重复构建。
 on:
-  push:
-    tags:
-      - 'v*'
-  # 也可在 Actions 页面手动触发，需填写 version
+  release:
+    types:
+      - published
   workflow_dispatch:
     inputs:
       version:
         description: '手动触发版本号，如 1.0.0 或 1.0.0-beta，无需 v 前缀'
         required: true
+        type: string
+      ref:
+        description: '要构建的分支或 tag（留空用默认分支）'
+        required: false
         type: string
 
 # 附加产物到 Release 需要写权限
@@ -27,25 +32,22 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: 1
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装 Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      # 统一解析版本：push tag 用 tag 名，手动触发用输入值
-      - name: 解析版本
+      # 统一解析版本：创建 Release 用其 tag 名，手动触发用输入值。
+      # 需在 checkout 之前执行，以决定检出哪个 ref。
+      - name: 解析版本与检出目标
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_REF: ${{ github.event.inputs.ref }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             RAW_VERSION="${INPUT_VERSION}"
+            CHECKOUT_REF="${INPUT_REF}"
           else
-            RAW_VERSION="${GITHUB_REF_NAME#v}"
+            RAW_VERSION="${RELEASE_TAG#v}"
+            CHECKOUT_REF="${RELEASE_TAG}"
           fi
 
           RAW_VERSION="${RAW_VERSION#v}"
@@ -55,10 +57,28 @@ jobs:
           echo "RAW_VERSION=$RAW_VERSION" >> "$GITHUB_ENV"
           echo "FILE_VERSION=$FILE_VERSION" >> "$GITHUB_ENV"
           echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+          echo "CHECKOUT_REF=$CHECKOUT_REF" >> "$GITHUB_ENV"
+
+      # Release 触发时必须显式检出 tag 对应的提交：release 事件的默认 sha 取自
+      # target_commitish（可能是分支头），不一定等于 tag 指向的提交。
+      # CHECKOUT_REF 为空（手动触发未填 ref）时按默认行为检出。
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       # ordered-set 为 Nuitka 官方推荐的编译提速依赖，其余为 GUI 运行依赖
       - name: 安装依赖
         run: python -m pip install nuitka ordered-set apscheduler pystray Pillow
+
+      # Inno Setup 6 提供 ISCC 编译器，用于把 standalone 产物打成单个安装程序
+      - name: 安装 Inno Setup
+        run: choco install innosetup -y --no-progress
 
       # 打包门禁：任一测试失败即终止，不出包
       - name: 运行测试
@@ -70,7 +90,7 @@ jobs:
           python -m tests.test_db
           python -m tests.test_env
 
-      # standalone 模式（非 Onefile）：产物为目录，由后续步骤整体 zip 分发。
+      # standalone 模式（非 Onefile）：产物为目录，作为安装包内容。
       # pystray / PIL 均存在运行期动态导入后端/插件模块，静态分析可能漏收，显式整包包含。
       - name: Nuitka standalone 打包 GUI
         shell: bash
@@ -90,17 +110,25 @@ jobs:
             --assume-yes-for-downloads \
             check_gui.py
 
-      # zip 内保留顶层目录 parkcheck-gui/，解压即用
-      - name: 压缩产物
+      # standalone 产物目录统一命名为 parkcheck-gui/，作为安装包内容目录
+      - name: 整理产物目录
+        shell: pwsh
+        run: Rename-Item build/check_gui.dist parkcheck-gui
+
+      # 编译单个安装程序（替代原先的 zip 分发）：用户双击安装到所选目录后
+      # 得到与 standalone 产物一致的文件夹结构，路径语义与解压 zip 完全相同
+      - name: 生成安装程序（Inno Setup）
         shell: pwsh
         run: |
-          Rename-Item build/check_gui.dist parkcheck-gui
-          Compress-Archive -Path build/parkcheck-gui -DestinationPath "parkcheck-gui-${{ env.TAG_NAME }}-windows-x64.zip"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = (Get-Command ISCC.exe).Source }
+          & $iscc "/DAppVersion=$env:FILE_VERSION" `
+                  "/DOutputName=parkcheck-setup-$env:TAG_NAME-windows-x64" `
+                  "installer/parkcheck.iss"
 
-      # 手动触发时显式指定 tag_name，确保 Release 能正确创建/更新
+      # Release 触发时附加到已存在的 Release（发布说明在建 Release 时编辑，不再自动生成追加）
       - name: 附加到 GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
-          files: parkcheck-gui-*.zip
-          generate_release_notes: true
+          files: build/parkcheck-setup-*.exe
